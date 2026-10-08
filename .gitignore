@@ -1,0 +1,13 @@
+# Local secrets: passwords and the admin email.
+.env
+
+# Scratch output.
+*.log
+
+# Tesseract ships English and orientation data in the Moodle image already;
+# only the Macedonian model has to travel with the repo. See the README.
+tessdata/*
+!tessdata/mkd.traineddata
+!tessdata/configs/
+!tessdata/tessconfigs/
+!tessdata/pdf.ttf

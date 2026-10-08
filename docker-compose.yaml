@@ -1,0 +1,82 @@
+# docker-compose.yml
+
+# Compose normally names the project after the folder it sits in, and the volumes
+# after the project. The courses, the database and the downloaded models all live
+# in volumes named for this one, so it is pinned here: renaming or moving the
+# folder would otherwise start a second, empty Moodle alongside the real one.
+name: documents
+
+services:
+  postgresql:
+    image: postgres:16-alpine
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    environment:
+      - POSTGRES_USER=moodle
+      # Values come from the .env file beside this one, which is not committed.
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=moodle
+    volumes:
+      - postgresql_data:/var/lib/postgresql/data
+
+  moodle:
+    # Built from the Dockerfile beside this file, which adds Poppler.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-moodle-with-poppler:local
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - '80:80'
+      - '443:443'
+    environment:
+      - MOODLE_DB_TYPE=pgsql
+      - MOODLE_DB_HOST=postgresql
+      - MOODLE_DB_PORT=5432
+      - MOODLE_DB_NAME=moodle
+      - MOODLE_DB_USER=moodle
+      - MOODLE_DB_PASSWORD=${DB_PASSWORD}
+      - MOODLE_URL=http://localhost
+      - MOODLE_ADMIN=admin
+      - MOODLE_ADMIN_PASSWORD=${MOODLE_ADMIN_PASSWORD}
+      - MOODLE_ADMIN_EMAIL=${MOODLE_ADMIN_EMAIL}
+      - PHP_UPLOAD_MAX_FILESIZE=256M
+      - PHP_POST_MAX_SIZE=256M
+      - PHP_MAX_EXECUTION_TIME=300
+    volumes:
+      - moodle_data:/var/moodledata
+      - moodle_www:/var/www/html
+      - ./uploads.ini:/usr/local/etc/php/conf.d/uploads.ini
+    depends_on:
+      - postgresql
+
+  # Reads text that sits inside pictures, which pdftotext cannot see.
+  docling:
+    image: quay.io/docling-project/docling-serve
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    ports:
+      - '5001:5001'
+    environment:
+      # The image bundles Latin OCR only. Emptying the artifacts path re-enables
+      # downloading, so the Cyrillic model is fetched the first time it is wanted
+      # and then kept in the volume below.
+      - DOCLING_SERVE_ARTIFACTS_PATH=
+    volumes:
+      # Model weights are a large download, so they outlive the container.
+      - docling_models:/opt/app-root/src/.cache
+      # Tesseract is the only bundled engine with a Macedonian model, and the
+      # image ships English alone, so its language directory is supplied here.
+      - ./tessdata:/usr/share/tesseract/tessdata:ro
+
+volumes:
+  postgresql_data:
+  moodle_data:
+  moodle_www:
+  docling_models:
