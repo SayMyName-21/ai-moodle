@@ -34,7 +34,7 @@ if (!$bookfile) {
     die();
 }
 
-// pdftotext needs a real path, so keep a working copy outside the file store.
+// The book is read from a real path, so keep a working copy outside the file store.
 $workdir = local_course_structure_workdir();
 $bookpath = $workdir . '/' . $bookfile->get_contenthash() . '.pdf';
 if (!file_exists($bookpath)) {

@@ -37,9 +37,13 @@ class slide_deck {
      * @return array Slides, each with a heading and bullets
      */
     public static function parse($pdfpath) {
-        $output = array();
-        exec('pdftotext -layout ' . escapeshellarg($pdfpath) . ' - 2>/dev/null', $output);
-        $pages = explode("\f", implode("\n", $output));
+        global $CFG;
+        require_once($CFG->dirroot . '/mod/book/classes/ai_service.php');
+
+        // Read the same careful way as the book. Docling marks a bullet with "-"
+        // rather than the "•" the deck was drawn with, and a heading may arrive
+        // prefixed with hashes; both spellings are accepted below.
+        $pages = \mod_book\ai_service::book_pages($pdfpath);
 
         $bullet = "\xe2\x80\xa2";
         $slides = array();
@@ -49,6 +53,11 @@ class slide_deck {
             $lines = array();
             foreach (preg_split('/\R/u', $page) as $line) {
                 $line = trim($line);
+                // Markdown emphasis and image placeholders are not wording.
+                $line = preg_replace('/^#{1,6}\s*/u', '', $line);
+                $line = str_replace(array('**', '<!-- image -->'), '', $line);
+                $line = trim($line);
+
                 if ($line !== '' && strpos($line, 'Powered by TCPDF') === false) {
                     $lines[] = $line;
                 }
@@ -67,6 +76,8 @@ class slide_deck {
             foreach ($lines as $line) {
                 if (mb_strpos($line, $bullet, 0, 'UTF-8') === 0) {
                     $bullets[] = trim(mb_substr($line, 1, null, 'UTF-8'));
+                } else if (preg_match('/^[-*]\s+(.*)$/u', $line, $m)) {
+                    $bullets[] = trim($m[1]);
                 } else if (empty($bullets)) {
                     $heading = ($heading === '') ? $line : $heading . ' ' . $line;
                 } else {

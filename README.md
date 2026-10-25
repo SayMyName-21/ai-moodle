@@ -148,17 +148,15 @@ All reachable from a tab row, inside any course:
 ```
 textbook PDF
    │
-   ├─ pdftotext ──────────────► table of contents ──► chapter detection (regex tiers)
-   │                                   │
-   │                                   └─► page offset detection
-   │                                        (printed page numbers ≠ PDF pages)
-   │
-   ├─ pdfseparate + pdfunite ──► page-range slice ──► Docling ──┐
-   │                                                            ├─► richer of the two
-   └─ pdftotext -layout ───────► page-range text ───────────────┘
-                                                                 │
-                                                                 ▼
-                                                      Groq → slide JSON
+   └─ Docling, 10 pages at a time ──► cached text of every page
+                                           │
+            ┌──────────────────────────────┼─────────────────────────┐
+            ▼                              ▼                         ▼
+   table of contents              page offset detection       page-range text
+            │                     (printed page numbers ≠           │
+            ▼                      PDF pages)                       ▼
+   chapter detection                                         Groq → slide JSON
+   (regex tiers, then the model)                                     │
                                                                  │
                                         ┌────────────────────────┼────────────────────┐
                                         ▼                        ▼                    ▼
@@ -175,31 +173,31 @@ matter shift everything. The table of contents says a chapter starts on page 6, 
 page 6 *as printed*. The offset is detected by searching the PDF for where the entries
 actually land, so page ranges extracted for slide generation are the right ones.
 
-### Text extraction: two readers, richer wins
+### Text extraction: Docling only
 
-`pdftotext` reads a PDF's text layer exactly and instantly. Docling reads the same pages
-with layout models and OCR. Both run on every page range and **whichever returns more
-wording is used**.
+Every page is read by Docling, which reads the PDF with layout models and OCR. Nothing
+else reads the book: an earlier version also ran Poppler's `pdftotext` and kept whichever
+reading was fuller, but Docling won on every measure that mattered.
 
-Measured on a real 9-page chunk:
+It rejoins words the book breaks across a line end. On a real 9-page chunk, of 116 words
+`pdftotext` had that Docling lacked, **111 were hyphenation fragments** — `површи`+`ната`,
+`чо`+`векот` — that Docling had correctly rejoined. That matters because the text feeds a
+model writing slides: `чо векот` is noise, `човекот` is a word. Docling also reads pages
+that are pure image, where `pdftotext` returns nothing.
 
-| | pdftotext | Docling |
-|---|---|---|
-| Time | 0.03 s | 30.8 s |
-| Characters | 15,406 | 17,491 |
+**The book is read once, ten pages at a time, and kept.** Each chunk is submitted to
+Docling's async API with a `page_range` and polled until done, so no single request has
+to survive the whole book. Measured on the 128-page textbook, ten-page chunks run at about
+4 s a page; one conversion of the whole book was still on page 2 after twenty minutes.
+Each finished chunk is saved, so an interrupted reading resumes rather than restarting,
+and once the book is read every later use is served from the cache in milliseconds.
 
-Docling wins on quality for a non-obvious reason: it rejoins words the book breaks across a
-line end. Of 116 words `pdftotext` had that Docling lacked, **111 were hyphenation
-fragments** — `површи`+`ната`, `чо`+`векот` — that Docling had correctly rejoined. That
-matters because the text feeds a model writing slides: `чо векот` is noise, `човекот` is a
-word.
+Docling also supplies the page count: chunks are read until one comes back short, and a
+chunk starting past the end is answered with the book's length.
 
-Docling also reads pages that are pure image, where `pdftotext` returns nothing.
-
-Because Docling sits in the hot path, two guards keep a failure cheap: connecting is capped
-at 5 seconds separately from the 300-second work timeout, and a run stops asking after two
-consecutive failures. With the service stopped, four page ranges cost 0.5 s in total
-instead of up to 1,200 s, and every one returned correct `pdftotext` output.
+**Failures are loud.** If Docling cannot be reached or cannot read a chunk, the work stops
+with Docling's own reason. Connecting is capped at 5 seconds, so a stopped service is
+noticed at once rather than after the 300-second work timeout.
 
 ### Macedonian OCR
 
@@ -295,25 +293,20 @@ group rules are respected without reimplementing them.
 
 | Component | Version / image | Role |
 |---|---|---|
-| Moodle | 4.0 (`2022041905`) | The LMS |
-| PHP | 7.4.33 | Moodle's runtime |
+| Moodle | 4.5.15 LTS (`2024100715`) | The LMS |
+| PHP | 8.3.36 | Moodle's runtime (first 8.3 release with the PHP2Shell fixes) |
 | PostgreSQL | 16-alpine | Database |
 | Docker Compose | v2 | Orchestration |
-| Debian | 11 (bullseye) | Base of the Moodle image |
+| Debian | 13 (trixie), via `php:8.3.36-apache` | Base of the Moodle image |
 
 ### PDF and OCR
 
 | Tool | Role |
 |---|---|
-| **Poppler** (`pdftotext`, `pdfinfo`, `pdfseparate`, `pdfunite`) | Text layer, page counts, lossless page-range slicing |
-| **Docling** (`quay.io/docling-project/docling-serve`) | Layout-aware reading and OCR, port 5001 |
+| **Docling** (`quay.io/docling-project/docling-serve`) | The only PDF reader: layout-aware reading, OCR and page counts, port 5001 |
 | **Tesseract 4.1** + `mkd.traineddata` | The only Macedonian-capable OCR engine available |
 | **TCPDF** (via Moodle `pdflib.php`) | Rendering slide decks, `freesans` for Cyrillic |
 | **ZipArchive** + OOXML | Writing `.pptx` by hand |
-
-Poppler is installed by the repo's `Dockerfile` rather than by hand. It was once installed
-into a running container and vanished the moment Compose recreated it, taking lecture
-generation with it.
 
 ### AI
 
@@ -347,7 +340,7 @@ chapter-extraction task.
 
 ### Requirements
 
-Docker Desktop. Nothing else — PHP, Poppler, Postgres and Docling all live in containers.
+Docker Desktop. Nothing else — PHP, Postgres and Docling all live in containers.
 
 ### Steps
 
@@ -382,18 +375,23 @@ docker exec documents-docling-1 tesseract --list-langs
 
 ### Installing the plugins
 
-The repo holds the plugin source. Copy it into the running Moodle:
+Nothing to copy. `docker-compose.yaml` bind-mounts both plugins from the repo into
+the container, so an edit under `plugins/` is live as soon as caches are purged:
 
 ```bash
-docker cp plugins/local_course_structure documents-moodle-1:/var/www/html/local/course_structure
-docker cp plugins/mod_book/classes/ai_service.php documents-moodle-1:/var/www/html/mod/book/classes/ai_service.php
-docker exec documents-moodle-1 chown -R www-data:www-data /var/www/html/local /var/www/html/mod/book
-docker exec documents-moodle-1 php /var/www/html/admin/cli/purge_caches.php
+docker exec -u www-data documents-moodle-1 php /var/www/html/admin/cli/purge_caches.php
 ```
 
-`plugins/mod_book` is Moodle's stock book module with `classes/ai_service.php` added and
+After changing a plugin's `version.php`, run the upgrade instead:
+
+```bash
+docker exec -u www-data documents-moodle-1 php /var/www/html/admin/cli/upgrade.php --non-interactive
+```
+
+`plugins/mod_book` is Moodle 4.5's stock book module with `classes/ai_service.php` added and
 four files modified (`settings.php`, `lib.php`, `mod_form.php`, `lang/en/book.php`). The
-other 116 files are upstream and unchanged.
+rest is upstream and unchanged. It replaces the core module wholesale, so upgrading Moodle
+means re-basing those four files onto the new version's copies.
 
 ### Last step
 
@@ -430,7 +428,8 @@ Book**. A free Groq key works: <https://console.groq.com>
 ```
 ai_moodle/
 ├── docker-compose.yaml          Services, pinned project name, volumes
-├── Dockerfile                   Moodle image + Poppler
+├── Dockerfile                   Moodle 4.5 on PHP 8.3
+├── config.php                   Moodle config, all values from the environment
 ├── uploads.ini                  PHP upload limits (256 MB)
 ├── .env.example                 Template for local secrets
 ├── tessdata/                    Tesseract language data, incl. Macedonian
@@ -464,7 +463,8 @@ Roughly 5,000 lines of original PHP across the two plugins.
 | `get_outline()` | Chapters, sub-topics, page ranges and page offset |
 | `list_sections()` | The parts a presentation can be built from |
 | `plan_from_selection()` | Turns a teacher's grouping into work to do |
-| `extract_pages()` | Page-range text, Poppler and Docling, richer wins |
+| `book_pages()` | Every page's text, read through Docling once and cached |
+| `extract_pages()` | Page-range text, served from that reading |
 | `generate_slides()` | Slides from a textbook extract |
 | `revise_slides()` | Applies a revision request as edits |
 | `generate_questions()` | Multiple-choice questions from a deck |
@@ -475,9 +475,10 @@ Roughly 5,000 lines of original PHP across the two plugins.
 ## Design decisions
 
 **Parsing beats prompting for structure.** Chapter detection, page offsets and table-of-
-contents parsing are deterministic regex and Poppler work. Early versions asked the model
+contents parsing are deterministic regex work first. Early versions asked the model
 and got subchapters, invented chapters, and literal example text from the prompt copied into
-the course.
+the course. The model is now consulted only when the contents carry no labels or numbers,
+and anything it names that is not in the contents verbatim is thrown away.
 
 **The deck is its own record.** Revision, quiz writing and the assistant all read slides
 back out of the deck PDF rather than from a database. One source of truth, and editing a
@@ -492,8 +493,9 @@ rebuilt rather than kept.
 which is normally taken from the folder name. `name: documents` in the compose file means
 renaming or moving the folder cannot silently start a second, empty Moodle.
 
-**Never make the working path worse.** Docling only wins where it returns more text,
-`force_ocr` stays off, and every external dependency falls back rather than failing.
+**One reader, failing loudly.** Docling is the only thing that reads the book, and a
+failure stops the work with Docling's reason rather than falling back to a worse reading.
+`force_ocr` stays off, so a real text layer is never overwritten by OCR.
 
 ---
 

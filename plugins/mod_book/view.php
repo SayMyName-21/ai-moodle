@@ -92,10 +92,15 @@ if ($chapterid == '0') { // Go to first chapter if no given.
 }
 
 // Prepare header.
-$pagetitle = $book->name;
+$titleparts = [];
 if ($chapter = $DB->get_record('book_chapters', ['id' => $chapterid, 'bookid' => $book->id])) {
-    $pagetitle .= ": {$chapter->title}";
+    $chaptertitle = book_get_chapter_title($chapterid, $chapters, $book, $context);
+    $titleparts[] = $chaptertitle;
 }
+$titleparts[] = format_string($book->name, true, ['context' => $context]);
+$pagetitle = implode(moodle_page::TITLE_SEPARATOR, $titleparts);
+
+$PAGE->set_other_editing_capability('mod/book:edit');
 $PAGE->set_title($pagetitle);
 $PAGE->set_heading($course->fullname);
 $PAGE->add_body_class('limitedwidth');
@@ -114,30 +119,29 @@ if (!$chapterid) {
     }
     // Add the Book TOC block.
     book_add_fake_block($chapters, $chapter, $book, $cm, $edit);
-    // We need to discover if this is the last chapter to mark activity as completed.
-    $islastchapter = $chapter->pagenum + 1 > count($chapters);
-    book_view($book, $chapter, $islastchapter, $course, $cm, $context);
+    book_view($book, $chapter, \mod_book\helper::is_last_visible_chapter($chapter->id, $chapters), $course, $cm, $context);
 
     echo $OUTPUT->header();
 
     $renderer = $PAGE->get_renderer('mod_book');
     $actionmenu = new \mod_book\output\main_action_menu($cm->id, $chapters, $chapter, $book);
     $renderedmenu = $renderer->render($actionmenu);
-    echo $renderedmenu;
+    echo html_writer::div($renderedmenu, '', ['id' => 'mod_book-chaptersnavigation']);
 
     // The chapter itself.
     $hidden = $chapter->hidden ? ' dimmed_text' : null;
-    echo $OUTPUT->box_start('generalbox book_content' . $hidden);
+    echo $OUTPUT->box_start('generalbox book_content' . $hidden, 'mod_book-chapter');
 
     if (!$book->customtitles) {
+        $headinglevel = $PAGE->activityheader->get_heading_level();
         if (!$chapter->subchapter) {
             $currtitle = book_get_chapter_title($chapter->id, $chapters, $book, $context);
-            echo $OUTPUT->heading($currtitle, 3);
+            echo $OUTPUT->heading($currtitle, $headinglevel);
         } else {
             $currtitle = book_get_chapter_title($chapters[$chapter->id]->parent, $chapters, $book, $context);
             $currsubtitle = book_get_chapter_title($chapter->id, $chapters, $book, $context);
-            echo $OUTPUT->heading($currtitle, 3);
-            echo $OUTPUT->heading($currsubtitle, 4);
+            echo $OUTPUT->heading($currtitle, $headinglevel);
+            echo $OUTPUT->heading($currsubtitle, ++$headinglevel);
         }
     }
     $chaptertext = file_rewrite_pluginfile_urls($chapter->content, 'pluginfile.php', $context->id, 'mod_book',
@@ -150,6 +154,5 @@ if (!$chapterid) {
     if (core_tag_tag::is_enabled('mod_book', 'book_chapters')) {
         echo $OUTPUT->tag_list(core_tag_tag::get_item_tags('mod_book', 'book_chapters', $chapter->id), null, 'book-tags');
     }
-    echo $renderedmenu;
 }
 echo $OUTPUT->footer();

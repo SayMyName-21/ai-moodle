@@ -72,14 +72,11 @@ $string['search:activity'] = 'Book - resource information';
 $string['search:chapter'] = 'Book - chapters';
 $string['showchapter'] = 'Show chapter "{$a}"';
 $string['subchapter'] = 'Subchapter';
-$string['navimages'] = 'Images';
 $string['navoptions'] = 'Available options for navigational links';
 $string['navoptions_desc'] = 'Options for displaying navigation on the book pages';
 $string['navstyle'] = 'Style of navigation';
 $string['navstyle_help'] = '* Images - Icons are used for navigation
 * Text - Chapter titles are used for navigation';
-$string['navtext'] = 'Text';
-$string['navtoc'] = 'TOC Only';
 $string['nocontent'] = 'No content has been added to this book yet.';
 $string['numbering'] = 'Chapter formatting';
 $string['numbering_help'] = '* None - Chapter and subchapter titles have no formatting
@@ -114,8 +111,15 @@ $string['subchapternotice'] = '(Only available once the first chapter has been c
 $string['subplugintype_booktool'] = 'Book tool';
 $string['subplugintype_booktool_plural'] = 'Book tools';
 
-$string['removeallbooktags'] = 'Remove all book tags';
+$string['removeallbooktags'] = 'All book tags';
 $string['tagarea_book_chapters'] = 'Book chapters';
+
+// Deprecated since Moodle 4.4.
+$string['navimages'] = 'Images';
+$string['navtext'] = 'Text';
+$string['navtoc'] = 'TOC Only';
+
+// Deprecated since Moodle 4.5.
 $string['tagsdeleted'] = 'Book tags have been deleted';
 
 // AI Chapter Extraction.
@@ -142,13 +146,11 @@ $string['ollamamodel'] = 'Ollama Model';
 $string['ollamamodel_desc'] = 'Ollama model to use for chapter extraction. Recommended: llama3, mistral, or llama3.1. Install models with: ollama pull llama3';
 $string['aiapikey'] = 'AI API Key';
 $string['aiapikey_desc'] = 'Enter your API key. Required for Groq, Claude, and OpenAI. Get a free Groq API key at: https://console.groq.com';
-$string['doclingsettings'] = 'Reading text inside pictures';
-$string['doclingsettings_desc'] = 'Docling reads the book\'s pages more carefully than pdftotext does. It rejoins words the book breaks across a line end, which pdftotext hands over in halves, and it reads a page that is a picture or a scan rather than text. Both readings are taken for every page range and the fuller one is used, so if Docling is unavailable, slow or wrong, pdftotext\'s reading stands and nothing is lost. The cost is time: expect roughly half a minute per page range, which on a full run adds several minutes.';
-$string['doclingenabled'] = 'Read book pages with Docling';
-$string['doclingenabled_desc'] = 'Requires the docling service from docker-compose to be running. Leave off to use pdftotext alone, which is far faster but leaves hyphenated words broken and cannot read scanned pages.';
+$string['doclingsettings'] = 'Reading the book';
+$string['doclingsettings_desc'] = 'Every page of the book is read by Docling, the only reader the plugin uses. It reads tables as tables, rejoins words the book breaks across a line end, and reads pages that are pictures or scans. The book is read once, ten pages at a time, and the reading is kept, so only the first use of a book waits for it; a reading that is interrupted resumes from the last finished ten pages. If Docling cannot be reached or cannot read a page, the work stops with Docling\'s reason rather than carrying on with a worse reading.';
 $string['doclingurl'] = 'Docling URL';
 $string['doclingurl_desc'] = 'Address of the Docling server. Default: http://docling:5001 (the service name inside Docker).';
 $string['doclingocrlang'] = 'Language on the page';
 $string['doclingocrlang_desc'] = 'Tesseract language code, such as mkd for Macedonian or eng for English; join several with a plus sign, as in mkd+eng. Tesseract is used because it is the only engine Docling ships with a Macedonian model, and its language files are supplied by the tessdata folder mounted in docker-compose.';
-$string['doclingtimeout'] = 'Timeout (seconds)';
-$string['doclingtimeout_desc'] = 'How long to let Docling work on one page range before giving up on it and using pdftotext\'s reading. A text page range takes around half a minute and a scanned one longer, so 300 leaves room for a slow range without stalling a run. Waiting for the connection itself is capped separately at a few seconds, so a server that is switched off costs seconds rather than the full timeout, and a run that meets two failures in a row stops asking Docling altogether.';
+$string['doclingtimeout'] = 'Timeout per ten pages (seconds)';
+$string['doclingtimeout_desc'] = 'How long to let Docling work on one run of ten pages before the reading stops with an error. Ten text pages take around forty seconds and scanned ones longer, so 300 leaves plenty of room. Waiting for the connection itself is capped separately at a few seconds, so a server that is switched off is noticed straight away.';

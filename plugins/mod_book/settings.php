@@ -94,16 +94,11 @@ if ($ADMIN->fulltree) {
         PARAM_TEXT,
         60));
 
-    // Reading text out of pictures.
+    // Reading the book. Docling is the only reader, so there is no switch for it.
 
     $settings->add(new admin_setting_heading('bookdoclingsettings',
         get_string('doclingsettings', 'mod_book'),
         get_string('doclingsettings_desc', 'mod_book')));
-
-    $settings->add(new admin_setting_configcheckbox('book/docling_enabled',
-        get_string('doclingenabled', 'mod_book'),
-        get_string('doclingenabled_desc', 'mod_book'),
-        0));
 
     $settings->add(new admin_setting_configtext('book/docling_url',
         get_string('doclingurl', 'mod_book'),

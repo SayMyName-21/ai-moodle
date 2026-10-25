@@ -21,8 +21,6 @@
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 
-defined('MOODLE_INTERNAL') || die;
-
 /**
  * Book module upgrade task
  *
@@ -30,32 +28,19 @@ defined('MOODLE_INTERNAL') || die;
  * @return bool always true
  */
 function xmldb_book_upgrade($oldversion) {
-    global $CFG, $DB;
-
-    $dbman = $DB->get_manager();
-
-    // Automatically generated Moodle v3.6.0 release upgrade line.
+    // Automatically generated Moodle v4.1.0 release upgrade line.
     // Put any upgrade step following this.
 
-    // Automatically generated Moodle v3.7.0 release upgrade line.
+    // Automatically generated Moodle v4.2.0 release upgrade line.
     // Put any upgrade step following this.
 
-    // Automatically generated Moodle v3.8.0 release upgrade line.
+    // Automatically generated Moodle v4.3.0 release upgrade line.
     // Put any upgrade step following this.
 
-    // Automatically generated Moodle v3.9.0 release upgrade line.
+    // Automatically generated Moodle v4.4.0 release upgrade line.
     // Put any upgrade step following this.
 
-    if ($oldversion < 2021052501) {
-        $table = new xmldb_table('book_chapters');
-        $index = new xmldb_index('bookid', XMLDB_INDEX_NOTUNIQUE, ['bookid']);
-        if (!$dbman->index_exists($table, $index)) {
-            $dbman->add_index($table, $index);
-        }
-        upgrade_mod_savepoint(true, 2021052501, 'book');
-    }
-
-    // Automatically generated Moodle v4.0.0 release upgrade line.
+    // Automatically generated Moodle v4.5.0 release upgrade line.
     // Put any upgrade step following this.
 
     return true;

@@ -476,9 +476,9 @@ class chat {
             $book->copy_content_to($path);
         }
 
-        $output = array();
-        exec('pdftotext -layout ' . escapeshellarg($path) . ' - 2>/dev/null', $output);
-        $pages = explode("\f", implode("\n", $output));
+        // The same careful reading the rest of the plugin works from, so the
+        // assistant quotes the book exactly as the lectures were written from it.
+        $pages = \mod_book\ai_service::book_pages($path);
 
         $words = self::keywords($question);
         if (empty($words)) {

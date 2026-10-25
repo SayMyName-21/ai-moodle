@@ -38,11 +38,28 @@ class ai_service {
     /** Seconds to leave between requests so the allowance has refilled. */
     const REQUEST_SPACING = 50;
 
+    /** Pages of front matter to search for the table of contents. */
+    const FRONT_MATTER_PAGES = 30;
+
     /** Seconds to wait for Docling to answer at all, as opposed to to finish. */
     const DOCLING_CONNECT_TIMEOUT = 5;
 
-    /** Consecutive Docling failures after which a run stops asking it. */
-    const DOCLING_GIVE_UP = 2;
+    /**
+     * Pages sent to Docling in one conversion.
+     *
+     * The book is read in chunks rather than whole: one conversion of a whole
+     * textbook ran for over twenty minutes as a single request that had to survive
+     * to the end, while ten pages at a time measured four seconds a page. A chunk
+     * that fails costs ten pages rather than the book, and each finished chunk is
+     * kept, so an interrupted reading resumes where it stopped.
+     */
+    const BOOK_CHUNK_PAGES = 10;
+
+    /**
+     * Seconds between asking Docling whether a chunk has finished. Its status
+     * check answers at once while a task runs, so the pause has to be ours.
+     */
+    const DOCLING_POLL_INTERVAL = 3;
 
     /**
      * Extract chapters from a book file using AI
@@ -52,7 +69,7 @@ class ai_service {
      * @return array Array of chapters with title and content
      * @throws \moodle_exception
      */
-    public static function extract_chapters($filepath, $filetype) {
+    public static function extract_chapters($filepath, $filetype, $guidance = '') {
         $config = get_config('book');
 
         // API key not required for Ollama (local/free)
@@ -69,7 +86,8 @@ class ai_service {
         }
 
         // Call AI API to extract chapters
-        $chapters = self::call_ai_api($content, $config->ai_api_key, $config->ai_provider ?? 'claude');
+        $chapters = self::call_ai_api($content, $config->ai_api_key,
+            $config->ai_provider ?? 'claude', $guidance);
 
         return $chapters;
     }
@@ -111,19 +129,306 @@ class ai_service {
      * @return string Extracted text
      */
     private static function extract_pdf_text($filepath) {
-        $output = array();
-        $return_var = 0;
+        // Docling reads a contents table as a table, which is what it is, and the
+        // rows come back as lines with the entry at the front - the shape the
+        // detection below expects. Read as Markdown instead it arrives wrapped in
+        // pipe delimiters, which put a "|" where the chapter label should be and
+        // left the detection finding 23 chapters and no sections.
+        $pages = array_slice(self::book_pages($filepath), 0, self::FRONT_MATTER_PAGES);
+        $text = implode("\n", $pages);
 
-        // -layout preserves indentation and dot leaders, which is how a table of
-        // contents encodes its heading hierarchy. Only the front matter is needed.
-        exec('pdftotext -layout -f 1 -l 30 ' . escapeshellarg($filepath) . ' - 2>/dev/null',
-             $output, $return_var);
-
-        if ($return_var !== 0 || empty($output)) {
-            throw new \Exception('pdftotext could not read this PDF. It may be a scanned image with no text layer.');
+        if (trim($text) === '') {
+            throw new \Exception('Docling found no text in the first ' .
+                self::FRONT_MATTER_PAGES . ' pages of this PDF.');
         }
 
-        return implode("\n", $output);
+        return $text;
+    }
+
+    /**
+     * Ask the model which level of a contents list holds the chapters.
+     *
+     * The last resort, for a book whose layout gives nothing away. Its answer is
+     * checked back against the contents before any of it is believed, and is
+     * dropped entirely where the structural scan already found more entries than
+     * the model returned, so a confident wrong answer cannot displace a right one.
+     *
+     * @param string $toc The table of contents
+     * @param array $structure What the structural scan made of it
+     * @return array Chapter titles, empty if the model was no help
+     */
+    private static function chapters_by_model($toc, $structure) {
+        try {
+            $reply = self::ask_model(self::build_chapter_prompt($toc), 2000);
+            $chapters = self::finalise_chapters(
+                self::normalise_chapters($reply), $toc, $structure);
+
+            return array_column($chapters, 'title');
+
+        } catch (\Exception $e) {
+            // Reading the book must not fail because the model was unreachable.
+            return array();
+        }
+    }
+
+    /**
+     * The whole book, one entry per page, as Docling reads it.
+     *
+     * Every part of the plugin that needs the book's wording comes through here,
+     * so the book is read the careful way once rather than many times. Reading a
+     * textbook through a layout model takes minutes, which is why the result is
+     * kept: the wait is paid once per book, on upload, and every page view
+     * afterwards is served from the cache.
+     *
+     * Docling is the only reader. If it cannot read the book this fails loudly,
+     * rather than quietly handing over a worse reading from another tool.
+     *
+     * @param string $filepath Path to the PDF
+     * @return array Page text, in order, the first entry being page one
+     * @throws \Exception if Docling cannot read the book
+     */
+    public static function book_pages($filepath) {
+        $dir = make_temp_directory('mod_book/bookpages');
+        $hash = sha1_file($filepath);
+        $cache = $dir . '/' . $hash . '.json';
+        $partial = $dir . '/' . $hash . '.partial.json';
+
+        if (file_exists($cache)) {
+            $cached = json_decode(file_get_contents($cache), true);
+            if (is_array($cached) && !empty($cached)) {
+                return $cached;
+            }
+        }
+
+        \core_php_time_limit::raise(7200);
+        raise_memory_limit(MEMORY_EXTRA);
+
+        // Chunks an earlier, interrupted reading already finished.
+        $pages = array();
+        if (file_exists($partial)) {
+            $kept = json_decode(file_get_contents($partial), true);
+            if (is_array($kept)) {
+                $pages = $kept;
+            }
+        }
+
+        // Docling learns the book's length only by reading it, so chunks are read
+        // until one comes back short: that one held the last page.
+        do {
+            $from = count($pages) + 1;
+            $chunk = self::docling_chunk($filepath, $from, $from + self::BOOK_CHUNK_PAGES - 1);
+            $pages = array_merge($pages, $chunk);
+            file_put_contents($partial, json_encode($pages));
+        } while (count($chunk) === self::BOOK_CHUNK_PAGES);
+
+        if (empty($pages)) {
+            throw new \Exception('Docling returned no pages for this PDF.');
+        }
+
+        file_put_contents($cache, json_encode($pages));
+        @unlink($partial);
+
+        return $pages;
+    }
+
+    /**
+     * Read a run of pages through Docling.
+     *
+     * The conversion is submitted as a task and then checked on, rather than held
+     * open as one long request, so a slow chunk is waited for without any single
+     * connection having to last minutes.
+     *
+     * @param string $filepath Path to the PDF
+     * @param int $from First page
+     * @param int $to Last page; may run past the end of the book
+     * @return array Text of each page read, in order from $from; empty if $from
+     *               lies past the end of the book
+     * @throws \Exception if Docling cannot read the pages
+     */
+    private static function docling_chunk($filepath, $from, $to) {
+        $config = get_config('book');
+        $url = rtrim(!empty($config->docling_url) ? $config->docling_url
+            : 'http://docling:5001', '/');
+        $timeout = (int)(!empty($config->docling_timeout) ? $config->docling_timeout : 300);
+        $ocrlang = !empty($config->docling_ocrlang) ? $config->docling_ocrlang : 'mkd';
+        $range = $from . '-' . $to;
+
+        // Tesseract is the only engine Docling offers with a Macedonian model, so
+        // it is asked for by name rather than left to automatic selection, which
+        // rejects the language outright. force_ocr stays off: it would overwrite a
+        // real text layer with a worse reading of it. The structured form keeps
+        // tables as tables and says which page each piece of wording came from.
+        $task = self::docling_request($url . '/v1/convert/source/async', array(
+            'options' => array(
+                'to_formats' => array('json'),
+                'do_ocr' => true,
+                'ocr_preset' => 'tesserocr',
+                'ocr_lang' => explode('+', $ocrlang),
+                'page_range' => array((int)$from, (int)$to),
+            ),
+            'sources' => array(array(
+                'kind' => 'file',
+                'filename' => 'book.pdf',
+                'base64_string' => base64_encode(file_get_contents($filepath)),
+            )),
+        ));
+        if (empty($task['task_id'])) {
+            throw new \Exception('Docling at ' . $url . ' did not accept pages ' . $range . '.');
+        }
+        $taskid = rawurlencode($task['task_id']);
+
+        $deadline = time() + $timeout;
+        while (true) {
+            $status = self::docling_request($url . '/v1/status/poll/' . $taskid);
+            $state = $status['task_status'] ?? '';
+            if (!in_array($state, array('pending', 'started')) || time() >= $deadline) {
+                break;
+            }
+            sleep(self::DOCLING_POLL_INTERVAL);
+        }
+
+        if ($state !== 'success') {
+            $why = !empty($status['error_message']) ? $status['error_message']
+                : ($state === '' ? 'no answer' : 'still ' . $state . ' after ' . $timeout . 's');
+            throw new \Exception('Docling could not read pages ' . $range . ': ' . $why);
+        }
+
+        $result = self::docling_request($url . '/v1/result/' . $taskid);
+        $document = $result['document']['json_content'] ?? null;
+        if (($result['status'] ?? '') === 'success' && is_array($document)) {
+            return self::pages_from_document($document, $from);
+        }
+
+        // A book whose length is an exact multiple of the chunk size ends with a
+        // chunk that starts past the last page, which Docling refuses by saying
+        // how long the book is.
+        $messages = array();
+        foreach ($result['errors'] ?? array() as $error) {
+            $message = (string)($error['error_message'] ?? '');
+            if (preg_match('/has (\d+) pages, fewer than the requested page_range start/',
+                    $message, $match) && (int)$match[1] < $from) {
+                return array();
+            }
+            $messages[] = $message;
+        }
+
+        throw new \Exception('Docling could not read pages ' . $range . ': ' .
+            ($messages ? implode('; ', $messages) : 'no document returned'));
+    }
+
+    /**
+     * Send one request to Docling and decode its JSON answer.
+     *
+     * @param string $url Full address
+     * @param array|null $body JSON body to POST, or null for a GET
+     * @return array|null The decoded answer, or null if Docling did not answer
+     */
+    private static function docling_request($url, $body = null) {
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        if ($body !== null) {
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body));
+            curl_setopt($ch, CURLOPT_HTTPHEADER, array('Content-Type: application/json'));
+        }
+        // Each request is short now the work happens in a task. A service that is
+        // down is noticed in seconds.
+        curl_setopt($ch, CURLOPT_TIMEOUT, 120);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, self::DOCLING_CONNECT_TIMEOUT);
+
+        $response = curl_exec($ch);
+        $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($httpcode !== 200) {
+            return null;
+        }
+
+        $decoded = json_decode($response, true);
+
+        return is_array($decoded) ? $decoded : null;
+    }
+
+    /**
+     * Lay a structured Docling document out as one block of text per page.
+     *
+     * Wording and table rows are gathered per page and put back into reading
+     * order by where they sat on the page, because Docling lists them by kind
+     * rather than by position. Table rows are joined into a line each, which is
+     * what lets a table of contents be read: Docling sees one as a table, and a
+     * row rendered as a line is the line the contents parser expects.
+     *
+     * @param array|null $document A Docling document
+     * @param int $from The first page it was asked for
+     * @return array Page text, in order from $from to the last page it holds
+     */
+    private static function pages_from_document($document, $from = 1) {
+        if (!is_array($document) || empty($document['pages'])) {
+            return array();
+        }
+
+        // Pages are keyed by their number in the whole book, even when only a
+        // range of it was converted.
+        $last = max(array_map('intval', array_keys($document['pages'])));
+        $items = array();
+
+        foreach ($document['texts'] ?? array() as $text) {
+            $page = $text['prov'][0]['page_no'] ?? 0;
+            $body = trim((string)($text['text'] ?? ''));
+            if ($page < 1 || $body === '') {
+                continue;
+            }
+            // A bullet has to look like one, or a slide deck read back from its
+            // own PDF would lose the shape the deck was written in.
+            if (($text['label'] ?? '') === 'list_item') {
+                $body = '- ' . $body;
+            }
+            $items[$page][] = array('top' => self::item_top($text), 'text' => $body);
+        }
+
+        foreach ($document['tables'] ?? array() as $table) {
+            $page = $table['prov'][0]['page_no'] ?? 0;
+            if ($page < 1) {
+                continue;
+            }
+
+            $rows = array();
+            foreach ($table['data']['table_cells'] ?? array() as $cell) {
+                $row = (int)($cell['start_row_offset_idx'] ?? 0);
+                $body = trim((string)($cell['text'] ?? ''));
+                if ($body !== '') {
+                    $rows[$row][] = $body;
+                }
+            }
+
+            ksort($rows);
+            $top = self::item_top($table);
+            foreach ($rows as $row) {
+                $items[$page][] = array('top' => $top--, 'text' => implode(' ', $row));
+            }
+        }
+
+        $pages = array();
+        for ($page = $from; $page <= $last; $page++) {
+            $onpage = $items[$page] ?? array();
+            // Higher on the page comes first; PDF coordinates grow upwards.
+            usort($onpage, function($a, $b) {
+                return $b['top'] <=> $a['top'];
+            });
+            $pages[] = implode("\n", array_column($onpage, 'text'));
+        }
+
+        return $pages;
+    }
+
+    /**
+     * How far up its page an item sits, for putting a page back in reading order.
+     *
+     * @param array $item A Docling text or table
+     * @return float Distance from the foot of the page
+     */
+    private static function item_top($item) {
+        return (float)($item['prov'][0]['bbox']['t'] ?? 0);
     }
 
     /**
@@ -134,8 +439,24 @@ class ai_service {
      */
     public static function get_outline($filepath) {
         $toc = self::extract_toc_section(self::extract_pdf_text($filepath));
-        $entries = self::toc_entries($toc);
         $structure = self::detect_main_chapters($toc);
+
+        // Tier three means the book names its chapters neither by label nor by
+        // number. Indenting cannot settle it either: Docling reads a contents
+        // table as a table and gives every cell in a column the column's left
+        // edge, so the indenting is gone from the data. A book can be laid out in
+        // ways no rule anticipates, so the model is asked to say which level holds
+        // the chapters. It may only choose from entries already in the contents -
+        // anything it returns that is not there verbatim is thrown away - so it
+        // can pick the wrong level but it cannot invent a chapter.
+        if ($structure['tier'] >= 3) {
+            $bymodel = self::chapters_by_model($toc, $structure);
+            if (count($bymodel) >= 2) {
+                $structure = array('titles' => $bymodel, 'tier' => 3);
+            }
+        }
+
+        $entries = self::toc_entries($toc);
         $mains = $structure['titles'];
 
         $total = self::pdf_page_count($filepath);
@@ -309,151 +630,19 @@ class ai_service {
      * @return string Extracted text
      */
     public static function extract_pages($filepath, $from, $to) {
-        $output = array();
-        exec('pdftotext -layout -f ' . (int)$from . ' -l ' . (int)$to . ' ' .
-             escapeshellarg($filepath) . ' - 2>/dev/null', $output);
-        $text = implode("\n", $output);
+        // Served from the book's one careful reading rather than read afresh, so a
+        // generation run spends its time on the model rather than on the PDF.
+        $pages = self::book_pages($filepath);
 
-        // Docling reads the same pages more carefully. It rejoins the words a book
-        // breaks across a line end, which pdftotext leaves in halves, and it reads
-        // a page that is a picture rather than text. Whichever reading carries the
-        // more wording is the one kept, so a failed or empty answer changes nothing.
-        $ocr = self::docling_pages($filepath, $from, $to);
-        if (mb_strlen(self::squash($ocr)) > mb_strlen(self::squash($text))) {
-            return $ocr;
+        $from = max(1, (int)$from);
+        $to = min(count($pages), (int)$to);
+        if ($to < $from) {
+            return '';
         }
 
-        return $text;
+        return implode("\n", array_slice($pages, $from - 1, $to - $from + 1));
     }
 
-    /**
-     * Strip whitespace so two extractions can be compared on wording alone.
-     *
-     * @param string $text Text to reduce
-     * @return string The text with all whitespace removed
-     */
-    private static function squash($text) {
-        return preg_replace('/\s+/u', '', (string)$text);
-    }
-
-    /**
-     * Read a page range through Docling, picking up text that sits inside pictures.
-     *
-     * @param string $filepath Path to the PDF
-     * @param int $from First page, as a PDF page number
-     * @param int $to Last page, as a PDF page number
-     * @return string The pages as Markdown, or an empty string if Docling was no help
-     */
-    private static function docling_pages($filepath, $from, $to) {
-        $config = get_config('book');
-        if (empty($config->docling_enabled)) {
-            return '';
-        }
-
-        // A run works through one page range after another. Once Docling has
-        // stopped answering, waiting out the timeout on every remaining range
-        // would cost far more than the reading is worth, so it is dropped for the
-        // rest of the run and pdftotext carries on alone.
-        static $failures = 0;
-        if ($failures >= self::DOCLING_GIVE_UP) {
-            return '';
-        }
-
-        // Only the wanted pages are sent, which keeps a slow converter bearable.
-        $slice = self::slice_pdf($filepath, $from, $to);
-        if ($slice === '') {
-            return '';
-        }
-
-        $url = rtrim(!empty($config->docling_url) ? $config->docling_url
-            : 'http://docling:5001', '/');
-
-        // Tesseract is the only engine Docling offers with a Macedonian model, so
-        // it is asked for by name rather than left to automatic selection, which
-        // rejects the language outright. force_ocr stays off: it would overwrite a
-        // real text layer with a worse reading of it.
-        $post = array(
-            'files' => new \CURLFile($slice, 'application/pdf', 'slice.pdf'),
-            'to_formats' => 'md',
-            'do_ocr' => 'true',
-            'ocr_preset' => 'tesserocr',
-            'ocr_lang' => !empty($config->docling_ocrlang) ? $config->docling_ocrlang : 'mkd',
-        );
-
-        $ch = curl_init($url . '/v1/convert/file');
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, $post);
-        curl_setopt($ch, CURLOPT_TIMEOUT,
-            (int)(!empty($config->docling_timeout) ? $config->docling_timeout : 300));
-        // Reading a long range legitimately takes minutes, but opening the
-        // connection should be instant. Separating the two means a service that is
-        // down is noticed in seconds instead of holding up the whole timeout.
-        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, self::DOCLING_CONNECT_TIMEOUT);
-
-        $response = curl_exec($ch);
-        $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-
-        remove_dir(dirname($slice));
-
-        $result = ($httpcode === 200) ? json_decode($response, true) : null;
-        if (!isset($result['document']['md_content'])) {
-            $failures++;
-            return '';
-        }
-
-        $failures = 0;
-
-        return (string)$result['document']['md_content'];
-    }
-
-    /**
-     * Copy a page range into a PDF of its own.
-     *
-     * The pages are copied rather than re-rendered, so the text layer the book
-     * already carries arrives intact.
-     *
-     * @param string $filepath Path to the PDF
-     * @param int $from First page
-     * @param int $to Last page
-     * @return string Path to the slice, or an empty string if it could not be made
-     */
-    private static function slice_pdf($filepath, $from, $to) {
-        $dir = make_temp_directory('mod_book/slice-' . uniqid());
-
-        exec('pdfseparate -f ' . (int)$from . ' -l ' . (int)$to . ' ' .
-             escapeshellarg($filepath) . ' ' .
-             escapeshellarg($dir . '/p-%d.pdf') . ' 2>/dev/null');
-
-        $pages = glob($dir . '/p-*.pdf');
-        if (empty($pages)) {
-            remove_dir($dir);
-            return '';
-        }
-
-        // glob sorts as text, which would put page 10 before page 2.
-        natsort($pages);
-        $pages = array_values($pages);
-
-        $merged = $dir . '/range.pdf';
-        if (count($pages) === 1) {
-            rename($pages[0], $merged);
-        } else {
-            $args = '';
-            foreach ($pages as $page) {
-                $args .= escapeshellarg($page) . ' ';
-            }
-            exec('pdfunite ' . $args . escapeshellarg($merged) . ' 2>/dev/null');
-        }
-
-        if (!file_exists($merged)) {
-            remove_dir($dir);
-            return '';
-        }
-
-        return $merged;
-    }
 
     /**
      * Put a question to the configured model and decode its JSON reply.
@@ -804,14 +993,9 @@ class ai_service {
      * @return int Page count, or 0 if it could not be read
      */
     private static function pdf_page_count($filepath) {
-        $output = array();
-        exec('pdfinfo ' . escapeshellarg($filepath) . ' 2>/dev/null', $output);
-        foreach ($output as $line) {
-            if (preg_match('/^Pages:\s*(\d+)/', $line, $match)) {
-                return (int)$match[1];
-            }
-        }
-        return 0;
+        // Docling counts the book's pages as it reads it, and the reading is kept,
+        // so asking here costs nothing once the book has been read through once.
+        return count(self::book_pages($filepath));
     }
 
     /**
@@ -826,9 +1010,7 @@ class ai_service {
      * @return int Offset to add to a printed page number
      */
     private static function detect_page_offset($filepath, $entries) {
-        $output = array();
-        exec('pdftotext -layout ' . escapeshellarg($filepath) . ' - 2>/dev/null', $output);
-        $pages = explode("\f", implode("\n", $output));
+        $pages = self::book_pages($filepath);
 
         $normalised = array();
         foreach ($pages as $i => $page) {
@@ -1185,7 +1367,7 @@ class ai_service {
      * @param string $toc Table of contents
      * @return string Prompt
      */
-    private static function build_chapter_prompt($toc) {
+    private static function build_chapter_prompt($toc, $guidance = '') {
         return "Below is a book's table of contents.\n\n" .
                "It has several levels of heading. Work out which level holds the book's " .
                "main divisions - the broad parts that every other entry sits inside - " .
@@ -1196,6 +1378,13 @@ class ai_service {
                "Return every entry at that one level, and nothing from any other level. " .
                "Copy each title verbatim. Return JSON:\n" .
                "{\"chapters\":[{\"title\":\"...\"},{\"title\":\"...\"}]}\n\n" .
+               // The teacher has seen the last answer and is correcting it, so this
+               // carries more weight than the general rules above.
+               ($guidance !== ''
+                   ? "THE TEACHER HAS LOOKED AT YOUR LAST ANSWER AND SAYS:\n" .
+                     mb_substr($guidance, 0, 600, 'UTF-8') .
+                     "\nFollow that over the guidance above where they disagree.\n\n"
+                   : '') .
                "TABLE OF CONTENTS:\n" . mb_substr($toc, 0, 12000, 'UTF-8');
     }
 
@@ -1268,9 +1457,9 @@ class ai_service {
      * @param string $provider AI provider (ollama, claude, openai)
      * @return array Array of chapters
      */
-    private static function call_ai_api($content, $apikey, $provider = 'groq') {
+    private static function call_ai_api($content, $apikey, $provider = 'groq', $guidance = '') {
         if ($provider === 'groq') {
-            return self::call_groq_api($content, $apikey);
+            return self::call_groq_api($content, $apikey, $guidance);
         } else if ($provider === 'ollama') {
             return self::call_ollama_api($content);
         } else if ($provider === 'claude') {
@@ -1289,7 +1478,7 @@ class ai_service {
      * @param string $apikey Groq API key
      * @return array Array of chapters
      */
-    private static function call_groq_api($content, $apikey) {
+    private static function call_groq_api($content, $apikey, $guidance = '') {
         $config = get_config('book');
         $model = $config->groq_model ?? 'openai/gpt-oss-120b';
 
@@ -1301,7 +1490,7 @@ class ai_service {
             'messages' => [
                 [
                     'role' => 'user',
-                    'content' => self::build_chapter_prompt($toc)
+                    'content' => self::build_chapter_prompt($toc, $guidance)
                 ]
             ],
             'temperature' => 0,

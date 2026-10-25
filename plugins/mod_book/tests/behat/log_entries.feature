@@ -14,7 +14,7 @@ Feature: In a book, verify log entries
       | activity | book      |
       | name     | Test book |
     And I am on the "Course 1" course page logged in as admin
-    And I am on "Course 1" course homepage with editing mode on
+    And I turn editing mode on
     And I am on the "Test book" "book activity" page
     And I set the following fields to these values:
       | Chapter title | First chapter |
@@ -30,8 +30,8 @@ Feature: In a book, verify log entries
       | Chapter title | First chapter edited |
       | Content | First chapter edited |
     And I press "Save changes"
-    And I click on "Next" "link"
-    And I click on "Previous" "link"
+    And I follow "Next: Second chapter"
+    And I follow "Previous: First chapter edited"
     And I navigate to "Print book" in current page administration
     And I am on the "Test book" "book activity" page
     And I navigate to "Download IMS CP" in current page administration
