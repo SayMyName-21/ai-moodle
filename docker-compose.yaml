@@ -21,19 +21,21 @@ services:
       - postgresql_data:/var/lib/postgresql/data
 
   moodle:
-    # Built from the Dockerfile beside this file, which adds Poppler.
+    # Built from the Dockerfile beside this file: Moodle 4.5 on PHP 8.3.
     build:
       context: .
       dockerfile: Dockerfile
-    image: ai-moodle-with-poppler:local
+    image: ai-moodle:4.5-php8.3
     dns:
       - 8.8.8.8
       - 1.1.1.1
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Bound to localhost only, so nothing else on the network can reach Moodle.
+    # Drop the 127.0.0.1 prefix only if other machines genuinely need access.
     ports:
-      - '80:80'
-      - '443:443'
+      - '127.0.0.1:80:80'
+      - '127.0.0.1:443:443'
     environment:
       - MOODLE_DB_TYPE=pgsql
       - MOODLE_DB_HOST=postgresql
@@ -50,19 +52,23 @@ services:
       - PHP_MAX_EXECUTION_TIME=300
     volumes:
       - moodle_data:/var/moodledata
-      - moodle_www:/var/www/html
+      # The Moodle code is in the image. Only the two plugins come from the repo,
+      # so editing them here takes effect without rebuilding.
+      - ./plugins/local_course_structure:/var/www/html/local/course_structure
+      - ./plugins/mod_book:/var/www/html/mod/book
       - ./uploads.ini:/usr/local/etc/php/conf.d/uploads.ini
     depends_on:
       - postgresql
 
-  # Reads text that sits inside pictures, which pdftotext cannot see.
+  # The only PDF reader: every page of the book is read here, including text that
+  # sits inside pictures.
   docling:
     image: quay.io/docling-project/docling-serve
     dns:
       - 8.8.8.8
       - 1.1.1.1
     ports:
-      - '5001:5001'
+      - '127.0.0.1:5001:5001'
     environment:
       # The image bundles Latin OCR only. Emptying the artifacts path re-enables
       # downloading, so the Cyrillic model is fetched the first time it is wanted
@@ -78,5 +84,4 @@ services:
 volumes:
   postgresql_data:
   moodle_data:
-  moodle_www:
   docling_models:

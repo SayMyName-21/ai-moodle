@@ -267,6 +267,6 @@ class quiz_builder {
             array($quiz->id));
 
         $DB->set_field('quiz', 'sumgrades', $sumgrades, array('id' => $quiz->id));
-        quiz_update_sumgrades($DB->get_record('quiz', array('id' => $quiz->id), '*', MUST_EXIST));
+        \mod_quiz\quiz_settings::create($quiz->id)->get_grade_calculator()->recompute_quiz_sumgrades();
     }
 }
