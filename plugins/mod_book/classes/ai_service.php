@@ -177,8 +177,9 @@ class ai_service {
      * Every part of the plugin that needs the book's wording comes through here,
      * so the book is read the careful way once rather than many times. Reading a
      * textbook through a layout model takes minutes, which is why the result is
-     * kept: the wait is paid once per book, on upload, and every page view
-     * afterwards is served from the cache.
+     * kept: the wait is paid once per book, and every use afterwards is served
+     * from the cache. A new book is read by a background task, which is what lets
+     * reading_progress() say how far it has got.
      *
      * Docling is the only reader. If it cannot read the book this fails loudly,
      * rather than quietly handing over a worse reading from another tool.
@@ -192,6 +193,7 @@ class ai_service {
         $hash = sha1_file($filepath);
         $cache = $dir . '/' . $hash . '.json';
         $partial = $dir . '/' . $hash . '.partial.json';
+        $length = $dir . '/' . $hash . '.pages';
 
         if (file_exists($cache)) {
             $cached = json_decode(file_get_contents($cache), true);
@@ -212,8 +214,16 @@ class ai_service {
             }
         }
 
-        // Docling learns the book's length only by reading it, so chunks are read
-        // until one comes back short: that one held the last page.
+        // Only so progress can be shown as a fraction; the reading itself does not
+        // depend on it.
+        if (!file_exists($length)) {
+            $total = self::docling_page_count($filepath);
+            if ($total > 0) {
+                file_put_contents($length, $total);
+            }
+        }
+
+        // Chunks are read until one comes back short: that one held the last page.
         do {
             $from = count($pages) + 1;
             $chunk = self::docling_chunk($filepath, $from, $from + self::BOOK_CHUNK_PAGES - 1);
@@ -227,16 +237,66 @@ class ai_service {
 
         file_put_contents($cache, json_encode($pages));
         @unlink($partial);
+        @unlink($length);
 
         return $pages;
     }
 
     /**
-     * Read a run of pages through Docling.
+     * How far the reading of a book has got.
      *
-     * The conversion is submitted as a task and then checked on, rather than held
-     * open as one long request, so a slow chunk is waited for without any single
-     * connection having to last minutes.
+     * Cheap enough to ask on every refresh of a progress page: it only looks at
+     * what book_pages() has written so far, and never asks Docling anything.
+     *
+     * @param string $hash SHA-1 of the PDF's content, which is Moodle's content hash
+     * @return array 'read' pages so far, 'total' pages or null if not yet known,
+     *               and 'done' once the whole book is read
+     */
+    public static function reading_progress($hash) {
+        $dir = make_temp_directory('mod_book/bookpages');
+        $base = $dir . '/' . clean_param($hash, PARAM_ALPHANUM);
+
+        if (file_exists($base . '.json')) {
+            $count = count((array)json_decode(file_get_contents($base . '.json'), true));
+            return array('read' => $count, 'total' => $count, 'done' => true);
+        }
+
+        $read = 0;
+        if (file_exists($base . '.partial.json')) {
+            $read = count((array)json_decode(file_get_contents($base . '.partial.json'), true));
+        }
+        $total = file_exists($base . '.pages') ? (int)file_get_contents($base . '.pages') : 0;
+
+        return array('read' => $read, 'total' => $total > 0 ? $total : null, 'done' => false);
+    }
+
+    /**
+     * How many pages a PDF has, according to Docling.
+     *
+     * Asking for a page far past the end is refused at once, before anything is
+     * converted, with a message that says how long the book is.
+     *
+     * @param string $filepath Path to the PDF
+     * @return int Page count, or zero if Docling did not say
+     */
+    private static function docling_page_count($filepath) {
+        try {
+            $result = self::docling_convert($filepath, 1000000, 1000000);
+        } catch (\Exception $e) {
+            return 0;
+        }
+
+        foreach ($result['errors'] ?? array() as $error) {
+            if (preg_match('/has (\d+) pages/', (string)($error['error_message'] ?? ''), $match)) {
+                return (int)$match[1];
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * Read a run of pages through Docling.
      *
      * @param string $filepath Path to the PDF
      * @param int $from First page
@@ -246,6 +306,44 @@ class ai_service {
      * @throws \Exception if Docling cannot read the pages
      */
     private static function docling_chunk($filepath, $from, $to) {
+        $result = self::docling_convert($filepath, $from, $to);
+
+        $document = $result['document']['json_content'] ?? null;
+        if (($result['status'] ?? '') === 'success' && is_array($document)) {
+            return self::pages_from_document($document, $from);
+        }
+
+        // A book whose length is an exact multiple of the chunk size ends with a
+        // chunk that starts past the last page, which Docling refuses by saying
+        // how long the book is.
+        $messages = array();
+        foreach ($result['errors'] ?? array() as $error) {
+            $message = (string)($error['error_message'] ?? '');
+            if (preg_match('/has (\d+) pages, fewer than the requested page_range start/',
+                    $message, $match) && (int)$match[1] < $from) {
+                return array();
+            }
+            $messages[] = $message;
+        }
+
+        throw new \Exception('Docling could not read pages ' . $from . '-' . $to . ': ' .
+            ($messages ? implode('; ', $messages) : 'no document returned'));
+    }
+
+    /**
+     * Have Docling convert a run of pages and return its answer.
+     *
+     * The conversion is submitted as a task and then checked on, rather than held
+     * open as one long request, so a slow chunk is waited for without any single
+     * connection having to last minutes.
+     *
+     * @param string $filepath Path to the PDF
+     * @param int $from First page
+     * @param int $to Last page
+     * @return array Docling's result, which may itself report a failure
+     * @throws \Exception if Docling could not be reached or the task did not finish
+     */
+    private static function docling_convert($filepath, $from, $to) {
         $config = get_config('book');
         $url = rtrim(!empty($config->docling_url) ? $config->docling_url
             : 'http://docling:5001', '/');
@@ -294,26 +392,11 @@ class ai_service {
         }
 
         $result = self::docling_request($url . '/v1/result/' . $taskid);
-        $document = $result['document']['json_content'] ?? null;
-        if (($result['status'] ?? '') === 'success' && is_array($document)) {
-            return self::pages_from_document($document, $from);
+        if ($result === null) {
+            throw new \Exception('Docling finished pages ' . $range . ' but returned no result.');
         }
 
-        // A book whose length is an exact multiple of the chunk size ends with a
-        // chunk that starts past the last page, which Docling refuses by saying
-        // how long the book is.
-        $messages = array();
-        foreach ($result['errors'] ?? array() as $error) {
-            $message = (string)($error['error_message'] ?? '');
-            if (preg_match('/has (\d+) pages, fewer than the requested page_range start/',
-                    $message, $match) && (int)$match[1] < $from) {
-                return array();
-            }
-            $messages[] = $message;
-        }
-
-        throw new \Exception('Docling could not read pages ' . $range . ': ' .
-            ($messages ? implode('; ', $messages) : 'no document returned'));
+        return $result;
     }
 
     /**
@@ -478,6 +561,18 @@ class ai_service {
         $chapters = array();
         $current = null;
         foreach ($entries as $entry) {
+            // Front matter belongs to no chapter; back matter ends the last one.
+            $kind = self::matter_kind($entry['title']);
+            if ($kind === 'front') {
+                continue;
+            }
+            if ($kind === 'back') {
+                if ($current !== null) {
+                    $chapters[] = $current;
+                    $current = null;
+                }
+                continue;
+            }
             if (in_array($entry['title'], $mains, true)) {
                 if ($current !== null) {
                     $chapters[] = $current;
@@ -494,12 +589,28 @@ class ai_service {
                     'title' => $entry['title'],
                     'page' => $entry['page'],
                     'endpage' => $entry['endpage'],
-                    'rank' => self::entry_rank($entry['title']),
                 );
             }
         }
         if ($current !== null) {
             $chapters[] = $current;
+        }
+
+        foreach ($chapters as $c => $chapter) {
+            $ranks = self::rank_subtopics(array_column($chapter['subtopics'], 'title'));
+            foreach ($ranks as $k => $rank) {
+                $chapters[$c]['subtopics'][$k]['rank'] = $rank;
+            }
+            // A heading such as "МОДУЛАРНА ЕДИНИЦА 2" may carry no page number of
+            // its own, in which case the chapter starts where its first entry does.
+            if ($chapter['page'] < 1) {
+                foreach ($chapter['subtopics'] as $sub) {
+                    if ($sub['page'] > 0) {
+                        $chapters[$c]['page'] = $sub['page'];
+                        break;
+                    }
+                }
+            }
         }
 
         return array('offset' => $offset, 'total' => $total, 'chapters' => $chapters);
@@ -508,46 +619,104 @@ class ai_service {
     /**
      * The parts of the book a presentation can be built from.
      *
-     * These are the divisions the book names inside each of its main chapters,
-     * which run to roughly one lecture's worth of material each.
+     * Each runs to roughly one lecture's worth of material, and which division
+     * that is depends on how the chapter is built:
+     *
+     * - A chapter divided into parts, as geography's ТЕМА 1 is into ЛИТОСФЕРА,
+     *   АТМОСФЕРА and so on, gives one section per part, holding its lessons.
+     * - A chapter that goes straight into numbered lessons, as a maths module
+     *   does, gives one section per lesson, holding whatever hangs under it. Taken
+     *   whole, such a chapter can run to fifty pages, far more than one request
+     *   to the model can carry.
+     * - A chapter with only plain headings gives one section per heading.
+     * - A chapter with nothing under it at all is one section by itself.
      *
      * @param array $outline Result of get_outline
      * @return array Sections in book order, each with its title, chapter and lessons
      */
     public static function list_sections($outline) {
         $sections = array();
+        $chapters = array_values($outline['chapters']);
 
-        foreach ($outline['chapters'] as $chapterindex => $chapter) {
-            $parts = array();
-            $current = null;
-            foreach ($chapter['subtopics'] as $sub) {
-                if ($sub['rank'] === 0) {
-                    $current = $sub['title'];
-                    $parts[$current] = array();
-                } else if ($current !== null) {
-                    $parts[$current][] = $sub;
-                }
+        foreach ($chapters as $chapterindex => $chapter) {
+            $subs = $chapter['subtopics'];
+
+            $parts = self::group_subtopics($subs, function($sub) {
+                return $sub['rank'] === 0;
+            });
+
+            if (empty($parts) && in_array(1, array_column($subs, 'rank'), true)) {
+                // Review exercises close a run of lessons without belonging to the
+                // last of them, so they stand as a section of their own.
+                $parts = self::group_subtopics($subs, function($sub) {
+                    return $sub['rank'] === 1 || self::matter_kind($sub['title']) === 'review';
+                });
             }
 
-            // A chapter that names no parts still has its lessons.
             if (empty($parts)) {
-                $parts[$chapter['title']] = $chapter['subtopics'];
+                foreach ($subs as $sub) {
+                    $parts[] = array('title' => $sub['title'], 'lessons' => array($sub));
+                }
             }
 
-            foreach ($parts as $name => $lessons) {
-                if (empty($lessons)) {
-                    continue;
-                }
+            if (empty($parts) && $chapter['page'] > 0) {
+                // It runs until the next chapter begins, or to the end of the book.
+                $next = $chapters[$chapterindex + 1]['page'] ?? 0;
+                $end = ($next > $chapter['page']) ? $next - 1
+                    : max($chapter['page'], $outline['total'] - $outline['offset']);
+                $parts[] = array('title' => $chapter['title'], 'lessons' => array(array(
+                    'title' => $chapter['title'],
+                    'page' => $chapter['page'],
+                    'endpage' => $end,
+                    'rank' => 1,
+                )));
+            }
+
+            foreach ($parts as $part) {
                 $sections[] = array(
-                    'title' => $name,
+                    'title' => $part['title'],
                     'chapter' => $chapter['title'],
                     'chapterindex' => $chapterindex,
-                    'lessons' => $lessons,
+                    'lessons' => $part['lessons'],
                 );
             }
         }
 
         return $sections;
+    }
+
+    /**
+     * Group a chapter's sub-entries under the ones that head a group.
+     *
+     * Entries before the first head belong to no group. A group whose head is
+     * followed by nothing is dropped, unless the head carries pages of its own:
+     * a part heading on its own says nothing, but a lesson is its own material.
+     *
+     * @param array $subs Sub-entries in book order
+     * @param callable $ishead Whether an entry starts a group
+     * @return array Groups, each with a title and its entries
+     */
+    private static function group_subtopics($subs, $ishead) {
+        $groups = array();
+        foreach ($subs as $sub) {
+            if ($ishead($sub)) {
+                $groups[] = array('title' => $sub['title'], 'head' => $sub, 'lessons' => array());
+            } else if (!empty($groups)) {
+                $groups[count($groups) - 1]['lessons'][] = $sub;
+            }
+        }
+
+        $kept = array();
+        foreach ($groups as $group) {
+            if ($group['head']['rank'] !== 0) {
+                array_unshift($group['lessons'], $group['head']);
+            }
+            if (!empty($group['lessons'])) {
+                $kept[] = array('title' => $group['title'], 'lessons' => $group['lessons']);
+            }
+        }
+
+        return $kept;
     }
 
     /**
@@ -591,6 +760,7 @@ class ai_service {
                 'title' => $group['title'],
                 'chapter' => $chapter,
                 'chapterindex' => $chapterindex,
+                'topic' => $group['topic'] ?? null,
                 'chunks' => $chunks,
             );
         }
@@ -1063,17 +1233,40 @@ class ai_service {
         if (count($hits) >= 5) {
             $start = $hits[0];
             $end = $hits[count($hits) - 1];
+
+            // The list can open with lines the dot-leader test misses: a heading
+            // that carries no page number, or two entries read as one. Where the
+            // list's own heading sits just above the first hit, start from there.
+            for ($i = $start - 1; $i >= max(0, $start - 10); $i--) {
+                if (self::is_contents_heading($lines[$i])) {
+                    $start = $i + 1;
+                    break;
+                }
+            }
+
             return implode("\n", array_slice($lines, $start, $end - $start + 1));
         }
 
         // No dot leaders, so look for a heading that announces the contents.
         foreach ($lines as $i => $line) {
-            if (preg_match('/^(содржина|садржај|sodrzina|contents|table of contents|inhalt|índice|sommaire)$/iu', trim($line))) {
+            if (self::is_contents_heading($line)) {
                 return implode("\n", array_slice($lines, $i + 1, 200));
             }
         }
 
         return mb_substr($text, 0, 6000, 'UTF-8');
+    }
+
+    /**
+     * Whether a line is the heading of a table of contents.
+     *
+     * @param string $line A line of text
+     * @return bool
+     */
+    private static function is_contents_heading($line) {
+        return (bool)preg_match(
+            '/^(содржина|садржај|sodrzina|contents|table of contents|inhalt|índice|sommaire)$/iu',
+            trim($line));
     }
 
     /**
@@ -1093,28 +1286,66 @@ class ai_service {
             return array('titles' => array(), 'tier' => 4);
         }
 
-        // A capitalised label followed by a number ("ТЕМА 1:", "CHAPTER 1", "PART I")
-        // marks the top division, whatever word a given book happens to use for it.
-        $labelled = array();
+        // A label that counts: the same words followed by 1, 2, 3 in order ("ТЕМА 1",
+        // "МОДУЛАРНА ЕДИНИЦА 2", "PART III") marks a division, whatever words a book
+        // uses and however many. A label that only appears once, or whose numbers do
+        // not climb, is a title that happens to contain a number. If a book counts
+        // more than one kind of division, the one met first is the outer one.
+        $groups = array();
+        $titles = array();
         foreach ($entries as $entry) {
-            if (preg_match('/^\p{Lu}[\p{Lu}]+\s+(?:\d{1,2}|[IVXLC]{1,5})\b/u', $entry['title'])) {
-                $labelled[] = $entry['title'];
+            $label = self::chapter_label($entry['title']);
+            if ($label !== null) {
+                $groups[$label['label']][] = $label['number'];
+                $titles[$label['label']][] = $entry['title'];
             }
         }
-        if (count($labelled) >= 2) {
-            return array('titles' => $labelled, 'tier' => 1);
+        foreach ($groups as $label => $numbers) {
+            $climbs = count($numbers) >= 2 && $numbers[0] <= 2;
+            for ($k = 1; $climbs && $k < count($numbers); $k++) {
+                $climbs = $numbers[$k] > $numbers[$k - 1];
+            }
+            if ($climbs) {
+                return array('titles' => $titles[$label], 'tier' => 1);
+            }
         }
 
-        // Otherwise whole-number entries, excluding "1.1" style subdivisions.
+        // Whole-number entries, excluding "1.1" style subdivisions.
         $numbered = array();
-        foreach ($entries as $entry) {
-            if (preg_match('/^\d{1,3}[\.\)]?\s+\S/u', $entry['title'])
+        foreach ($entries as $i => $entry) {
+            if (preg_match('/^(\d{1,3})[\.\)]?\s+\S/u', $entry['title'], $match)
                 && !preg_match('/^\d+\.\d/u', $entry['title'])) {
-                $numbered[] = $entry['title'];
+                $numbered[$i] = (int)$match[1];
             }
         }
+
+        // Numbering that starts again from 1 means the numbered entries sit inside
+        // something, and that something is the unnumbered entry just before each
+        // fresh start - the way a book's lessons restart in every unit. Front matter
+        // and review sections in between are passed over.
+        $starts = array_keys($numbered, 1, true);
+        if (count($starts) >= 2) {
+            $parents = array();
+            foreach ($starts as $start) {
+                for ($i = $start - 1; $i >= 0; $i--) {
+                    if (isset($numbered[$i]) || preg_match('/^\d/u', $entries[$i]['title'])) {
+                        break;
+                    }
+                    if (self::matter_kind($entries[$i]['title']) === null) {
+                        $parents[] = $entries[$i]['title'];
+                        break;
+                    }
+                }
+            }
+            if (count($parents) === count($starts)) {
+                return array('titles' => $parents, 'tier' => 2);
+            }
+        }
+
         if (count($numbered) >= 2) {
-            return array('titles' => $numbered, 'tier' => 2);
+            return array('titles' => array_map(function($i) use ($entries) {
+                return $entries[$i]['title'];
+            }, array_keys($numbered)), 'tier' => 2);
         }
 
         // Last resort: whichever entries are indented the least.
@@ -1129,6 +1360,142 @@ class ai_service {
             }
         }
         return array('titles' => $shallow, 'tier' => 3);
+    }
+
+    /**
+     * The counting label a contents entry opens with, if any.
+     *
+     * One to three capitalised words followed by a number, as in "ТЕМА 1:",
+     * "МОДУЛАРНА ЕДИНИЦА 2." or "Part IV". Front and back matter never count, so
+     * "ПРИЛОГ 1" is not mistaken for a chapter.
+     *
+     * @param string $title Entry title
+     * @return array|null 'label', upper-cased, and 'number'; null if there is none
+     */
+    private static function chapter_label($title) {
+        if (!preg_match('/^(\p{Lu}\p{L}*(?:\s+\p{Lu}\p{L}*){0,2})\s+(\d{1,2}|[IVXLC]{1,5})(?=[\s.:)\-–]|$)/u',
+                $title, $match) || self::matter_kind($title) !== null) {
+            return null;
+        }
+
+        $number = $match[2];
+        if (!ctype_digit($number)) {
+            $values = array('I' => 1, 'V' => 5, 'X' => 10, 'L' => 50, 'C' => 100);
+            $total = 0;
+            for ($k = 0; $k < strlen($number); $k++) {
+                $value = $values[$number[$k]];
+                $next = ($k + 1 < strlen($number)) ? $values[$number[$k + 1]] : 0;
+                $total += ($value < $next) ? -$value : $value;
+            }
+            $number = $total;
+        }
+
+        return array('label' => mb_strtoupper($match[1], 'UTF-8'), 'number' => (int)$number);
+    }
+
+    /**
+     * Whether a contents entry is part of the book's apparatus rather than its matter.
+     *
+     * Front matter comes before the chapters and belongs to none of them. Review
+     * sections recur inside chapters and belong to them, but never head one. Back
+     * matter - appendices, answers, bibliography, index - ends the last chapter.
+     *
+     * @param string $title Entry title
+     * @return string|null 'front', 'review' or 'back', or null for ordinary matter
+     */
+    private static function matter_kind($title) {
+        $title = trim($title);
+        if (preg_match('/^(предговор|предзбор|содржина|predgovor|sodr[zž]ina|preface|foreword|' .
+                'table of contents|contents|acknowledg)/iu', $title)) {
+            return 'front';
+        }
+        if (preg_match('/^(задачи за повторување|прашања за повторување|повторување|' .
+                'review|revision|exercises)/iu', $title)) {
+            return 'review';
+        }
+        if (preg_match('/^(прилог|прилози|додаток|решенија|одговори|литература|користена литература|' .
+                'библиографија|регистар|индекс|речник|appendix|answers|solutions|bibliography|' .
+                'references|index|glossary)/iu', $title)) {
+            return 'back';
+        }
+        return null;
+    }
+
+    /**
+     * Whether a contents line opens an entry of its own.
+     *
+     * Such a line is never the second half of a title wrapped from the line before.
+     *
+     * @param string $title Line with any dot leader removed
+     * @return bool
+     */
+    private static function starts_entry($title) {
+        return preg_match('/^\d{1,3}(?:\.\d{1,3})*[\.\)]?\s+\p{L}/u', $title)
+            || self::chapter_label($title) !== null
+            || self::matter_kind($title) !== null;
+    }
+
+    /**
+     * Separate contents entries that were read together onto one line.
+     *
+     * Docling sometimes reads two neighbouring entries as one cell, which comes out
+     * as "Preface....... 1. Sequences....... 7 9": each title keeps its dot leader
+     * and the page numbers gather at the end, in order. Split only where the count
+     * of page numbers matches the count of titles, so nothing is guessed.
+     *
+     * @param string $line A contents line
+     * @return array One line per entry
+     */
+    private static function split_merged_entries($line) {
+        $parts = preg_split('/\.{4,}\s*(?=\p{L}|\d{1,3}[\.\)]\s+\p{L})/u', $line);
+        if (count($parts) < 2) {
+            return array($line);
+        }
+
+        $last = array_pop($parts);
+        if (!preg_match('/^(.*?)\.{2,}\s*((?:\d{1,4}\s+)+\d{1,4})\s*$/u', $last, $match)) {
+            return array($line);
+        }
+        $pages = preg_split('/\s+/u', trim($match[2]));
+        $parts[] = $match[1];
+        if (count($pages) !== count($parts)) {
+            return array($line);
+        }
+
+        $split = array();
+        foreach ($parts as $k => $title) {
+            $split[] = trim($title) . '.......... ' . $pages[$k];
+        }
+        return $split;
+    }
+
+    /**
+     * Rank a chapter's sub-entries for nesting, reading unnumbered ones in context.
+     *
+     * An unnumbered entry is a part that the lessons sit inside when the chapter
+     * opens with one, as "ЛИТОСФЕРА" opens a run of numbered lessons. When the
+     * chapter opens with a numbered lesson instead, its unnumbered entries hang
+     * under the lessons, as "Линеарна функција" does under lesson 4.
+     *
+     * @param array $titles Sub-entry titles in book order
+     * @return array Rank of each, keyed alike
+     */
+    private static function rank_subtopics($titles) {
+        $ranks = array();
+        foreach ($titles as $key => $title) {
+            $ranks[$key] = self::entry_rank($title);
+        }
+
+        $first = reset($ranks);
+        if ($first !== false && $first !== 0) {
+            foreach ($ranks as $key => $rank) {
+                if ($rank === 0) {
+                    $ranks[$key] = 3;
+                }
+            }
+        }
+
+        return $ranks;
     }
 
     /**
@@ -1237,10 +1604,16 @@ class ai_service {
 
             $items = array();
             for ($i = $marks[$idx] + 1; $i < $to; $i++) {
-                $items[] = array(
-                    'title' => $entries[$i]['title'],
-                    'rank' => self::entry_rank($entries[$i]['title']),
-                );
+                $kind = self::matter_kind($entries[$i]['title']);
+                if ($kind === 'back') {
+                    break;
+                }
+                if ($kind !== 'front') {
+                    $items[] = array('title' => $entries[$i]['title']);
+                }
+            }
+            foreach (self::rank_subtopics(array_column($items, 'title')) as $k => $rank) {
+                $items[$k]['rank'] = $rank;
             }
 
             $chapters[$idx]['summary'] = self::render_subtopics($items);
@@ -1256,7 +1629,17 @@ class ai_service {
      * @return array Entries with a title, an indent and the printed page number
      */
     private static function toc_entries($toc) {
-        $lines = preg_split('/\R/u', $toc);
+        $lines = array();
+        foreach (preg_split('/\R/u', $toc) as $line) {
+            // A line holding nothing but a number is the contents page's own page
+            // number, which would otherwise be glued onto the entry after it.
+            if (preg_match('/^\s*\d{1,4}\s*$/u', $line)) {
+                continue;
+            }
+            foreach (self::split_merged_entries($line) as $part) {
+                $lines[] = $part;
+            }
+        }
 
         // Rejoining relies on the page number marking where an entry ends, so it only
         // applies to a contents list that actually carries page numbers.
@@ -1284,6 +1667,15 @@ class ai_service {
             $indent = mb_strlen($line, 'UTF-8') - mb_strlen(ltrim($line), 'UTF-8');
             $title = self::strip_leader($line);
             $haspage = preg_match('/\.{2,}\s*(\d{1,4})\s*$/u', $line, $match);
+
+            // A line that opens with its own number, label or apparatus heading is a
+            // new entry, so whatever was waiting for its second half stands alone.
+            if ($pending !== '' && self::starts_entry($title)) {
+                if (mb_strlen($pending, 'UTF-8') >= 3) {
+                    $entries[] = array('title' => $pending, 'indent' => $pendingindent, 'page' => 0);
+                }
+                $pending = '';
+            }
 
             if ($rejoin && !$haspage) {
                 // No page number, so this is the opening half of a wrapped title.
@@ -1414,7 +1806,7 @@ class ai_service {
         // levels have been run together, and the labelled entries are the level asked for.
         $labelled = array();
         foreach ($verified as $chapter) {
-            if (preg_match('/^\p{Lu}[\p{Lu}]+\s+(?:\d{1,2}|[IVXLC]{1,5})\b/u', $chapter['title'])) {
+            if (self::chapter_label($chapter['title']) !== null) {
                 $labelled[] = $chapter;
             }
         }

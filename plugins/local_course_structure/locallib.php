@@ -100,6 +100,29 @@ function local_course_structure_workdir() {
 }
 
 /**
+ * The book kept from the upload, somewhere Docling can be handed it.
+ *
+ * @param context_course $context Course context
+ * @return array|null Path and file name, or null if no book is stored
+ */
+function local_course_structure_stored_book($context) {
+    $fs = get_file_storage();
+    $files = $fs->get_area_files($context->id, 'local_course_structure', 'book',
+        0, 'itemid', false);
+    $file = reset($files);
+    if (!$file) {
+        return null;
+    }
+
+    $path = local_course_structure_workdir() . '/' . $file->get_contenthash() . '.pdf';
+    if (!file_exists($path)) {
+        $file->copy_content_to($path);
+    }
+
+    return array($path, $file->get_filename());
+}
+
+/**
  * The presentations the generator has built, with any PowerPoint versions.
  *
  * @param int $courseid Course

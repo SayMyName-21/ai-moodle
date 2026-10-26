@@ -470,6 +470,12 @@ class chat {
             return '';
         }
 
+        // Not while it is still being read: the assistant answers without the book
+        // rather than make the asker wait for the whole reading.
+        if (!\mod_book\ai_service::reading_progress($book->get_contenthash())['done']) {
+            return '';
+        }
+
         $workdir = make_temp_directory('local_course_structure/chat');
         $path = $workdir . '/book-' . $book->get_contenthash() . '.pdf';
         if (!file_exists($path)) {

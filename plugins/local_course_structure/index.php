@@ -32,10 +32,6 @@ $PAGE->set_title(get_string('coursestructure', 'local_course_structure'));
 $PAGE->set_heading($course->fullname);
 $PAGE->set_pagelayout('incourse');
 
-echo $OUTPUT->header();
-echo local_course_structure_tabs($courseid, 'structure');
-echo $OUTPUT->heading(get_string('generatecoursestructure', 'local_course_structure'));
-
 /**
  * Name the course's topics after a list of chapters.
  *
@@ -98,60 +94,27 @@ function local_course_structure_apply($courseid, $chapters, $includesubtopics) {
 }
 
 /**
- * The book kept from the upload, somewhere Docling can be handed it.
+ * The book stored for the course.
  *
  * @param context_course $context Course context
- * @return array|null Path and file name, or null if no book is stored
+ * @return stored_file|null The book, or null if none is stored
  */
-function local_course_structure_stored_book($context) {
-    $fs = get_file_storage();
-    $files = $fs->get_area_files($context->id, 'local_course_structure', 'book',
-        0, 'itemid', false);
+function local_course_structure_book_file($context) {
+    $files = get_file_storage()->get_area_files($context->id, 'local_course_structure',
+        'book', 0, 'itemid', false);
     $file = reset($files);
-    if (!$file) {
-        return null;
-    }
 
-    $path = local_course_structure_workdir() . '/' . $file->get_contenthash() . '.pdf';
-    if (!file_exists($path)) {
-        $file->copy_content_to($path);
-    }
-
-    return array($path, $file->get_filename());
+    return $file ?: null;
 }
 
-// What the book appears to be divided into, awaiting the teacher's word.
-$proposal = null;
-
+// Uploading a book, or asking for it to be read again, only starts the reading in
+// the background and comes straight back here to watch it. A textbook takes
+// minutes to hours to read, far longer than a page can be left loading.
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['bookfile'])) {
+    require_sesskey();
     $upload = $_FILES['bookfile'];
 
-    if ($upload['error'] === UPLOAD_ERR_OK) {
-        $filename = $upload['name'];
-
-        // The book has to outlive this request: the chapters are only proposed
-        // here, and the lectures are written from it later.
-        $fs = get_file_storage();
-        $fs->delete_area_files($context->id, 'local_course_structure', 'book', 0);
-        $fs->create_file_from_pathname(array(
-            'contextid' => $context->id,
-            'component' => 'local_course_structure',
-            'filearea'  => 'book',
-            'itemid'    => 0,
-            'filepath'  => '/',
-            'filename'  => clean_param($filename, PARAM_FILE),
-        ), $upload['tmp_name']);
-
-        try {
-            $proposal = \mod_book\ai_service::extract_chapters($upload['tmp_name'],
-                strtolower(pathinfo($filename, PATHINFO_EXTENSION)));
-        } catch (Exception $e) {
-            echo $OUTPUT->notification(
-                get_string('processingerror', 'local_course_structure') . ': ' .
-                $e->getMessage(), 'notifyerror');
-        }
-
-    } else {
+    if ($upload['error'] !== UPLOAD_ERR_OK) {
         $errors = array(
             UPLOAD_ERR_INI_SIZE => 'File exceeds upload_max_filesize',
             UPLOAD_ERR_FORM_SIZE => 'File exceeds MAX_FILE_SIZE',
@@ -161,35 +124,62 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['bookfile'])) {
             UPLOAD_ERR_CANT_WRITE => 'Failed to write file to disk',
             UPLOAD_ERR_EXTENSION => 'Upload stopped by extension',
         );
-        echo $OUTPUT->notification(
-            get_string('uploaderror', 'local_course_structure') . ' ' .
-            ($errors[$upload['error']] ?? 'Unknown error'), 'notifyerror');
+        redirect($PAGE->url, get_string('uploaderror', 'local_course_structure') . ' ' .
+            ($errors[$upload['error']] ?? 'Unknown error'), null,
+            \core\output\notification::NOTIFY_ERROR);
     }
 
-} else if ($retry && confirm_sesskey()) {
-    $book = local_course_structure_stored_book($context);
+    // The book has to outlive this request: it is read in the background, and the
+    // lectures are written from it later.
+    $fs = get_file_storage();
+    $fs->delete_area_files($context->id, 'local_course_structure', 'book', 0);
+    $book = $fs->create_file_from_pathname(array(
+        'contextid' => $context->id,
+        'component' => 'local_course_structure',
+        'filearea'  => 'book',
+        'itemid'    => 0,
+        'filepath'  => '/',
+        'filename'  => clean_param($upload['name'], PARAM_FILE),
+    ), $upload['tmp_name']);
 
+    \local_course_structure\reading::start($courseid, $book, '', $includesubtopics);
+    redirect($PAGE->url);
+}
+
+if ($retry) {
+    require_sesskey();
+    $book = local_course_structure_book_file($context);
     if ($book === null) {
-        echo $OUTPUT->notification(
-            get_string('nobookstored', 'local_course_structure'), 'notifyerror');
-    } else {
-        list($path, $filename) = $book;
-        try {
-            // The book is read again with the teacher's correction in hand.
-            $proposal = \mod_book\ai_service::extract_chapters($path,
-                strtolower(pathinfo($filename, PATHINFO_EXTENSION)), $guidance);
-        } catch (Exception $e) {
-            echo $OUTPUT->notification(
-                get_string('processingerror', 'local_course_structure') . ': ' .
-                $e->getMessage(), 'notifyerror');
-        }
+        redirect($PAGE->url, get_string('nobookstored', 'local_course_structure'), null,
+            \core\output\notification::NOTIFY_ERROR);
     }
 
-} else if ($confirm && confirm_sesskey()) {
+    // The book is read again with the teacher's correction in hand. Pages already
+    // read are kept, so this repeats the chapter detection rather than the reading.
+    $previous = \local_course_structure\reading::get($courseid);
+    \local_course_structure\reading::start($courseid, $book, $guidance,
+        $previous['includesubtopics'] ?? true);
+    redirect($PAGE->url);
+}
+
+echo $OUTPUT->header();
+echo local_course_structure_tabs($courseid, 'structure');
+echo $OUTPUT->heading(get_string('generatecoursestructure', 'local_course_structure'));
+
+$reading = \local_course_structure\reading::get($courseid);
+$status = $reading['status'] ?? '';
+
+// What the book appears to be divided into, awaiting the teacher's word.
+$proposal = null;
+
+if ($confirm && confirm_sesskey()) {
     // The teacher may have edited the list, so the text area is what counts and
-    // the proposal only supplies the sub-topics for titles that survived it.
+    // the proposal only supplies the sub-topics for titles that survived it. A
+    // proposal made before readings moved to the background lives in the session.
+    $proposed = ($status === 'ready') ? $reading['proposal']
+        : ($SESSION->local_course_structure_proposal ?? array());
     $summaries = array();
-    foreach ($SESSION->local_course_structure_proposal ?? array() as $chapter) {
+    foreach ($proposed as $chapter) {
         $summaries[trim($chapter['title'])] = $chapter['summary'] ?? '';
     }
 
@@ -208,6 +198,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['bookfile'])) {
     } else {
         local_course_structure_apply($courseid, $chapters, $includesubtopics);
         unset($SESSION->local_course_structure_proposal);
+        \local_course_structure\reading::clear($courseid);
 
         echo $OUTPUT->notification(
             get_string('structurecreated', 'local_course_structure', count($chapters)),
@@ -238,9 +229,80 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['bookfile'])) {
     }
 }
 
+// Still being read: say how far it has got, and look again shortly.
+if ($status === 'queued' || $status === 'reading') {
+    $progress = \mod_book\ai_service::reading_progress($reading['contenthash']);
+    $ispdf = strtolower(pathinfo($reading['filename'], PATHINFO_EXTENSION)) === 'pdf';
+    $a = (object)array(
+        'filename' => s($reading['filename']),
+        'read' => $progress['read'],
+        'total' => $progress['total'],
+    );
+
+    echo '<div class="card"><div class="card-body">';
+    echo $OUTPUT->heading(get_string('readingheading', 'local_course_structure'), 4);
+
+    if ($status === 'queued') {
+        echo '<p>' . get_string('readingqueued', 'local_course_structure', $a->filename) . '</p>';
+        // The worker picks a task up within a minute; much longer means it is not
+        // running at all.
+        if (time() - $reading['queued'] > 180) {
+            echo $OUTPUT->notification(
+                get_string('readingqueuedslow', 'local_course_structure'), 'notifywarning');
+        }
+    } else if (!$ispdf || $progress['done']) {
+        echo '<p>' . get_string('readingchapters', 'local_course_structure') . '</p>';
+    } else if ($progress['total']) {
+        $percent = (int)floor(100 * $progress['read'] / $progress['total']);
+        echo '<p>' . get_string('readingpages', 'local_course_structure', $a) . '</p>';
+        echo '<div class="progress mb-3" style="height: 1.5rem;">' .
+             '<div class="progress-bar" role="progressbar" style="width: ' . $percent . '%;" ' .
+             'aria-valuenow="' . $percent . '" aria-valuemin="0" aria-valuemax="100">' .
+             $percent . '%</div></div>';
+    } else {
+        echo '<p>' . get_string('readingpagesnototal', 'local_course_structure', $a) . '</p>';
+    }
+
+    if (!empty($reading['started'])) {
+        echo '<p class="text-muted small">' . get_string('readingstarted', 'local_course_structure',
+            userdate($reading['started'], get_string('strftimedatetimeshort', 'langconfig'))) . '</p>';
+    }
+    echo '<p class="text-muted small mb-0">' .
+         get_string('readingclose', 'local_course_structure') . '</p>';
+    echo '</div></div>';
+
+    $PAGE->requires->js_init_code('setTimeout(function() { window.location.reload(); }, 15000);');
+    echo $OUTPUT->footer();
+    die();
+}
+
+if ($status === 'ready') {
+    $proposal = $reading['proposal'];
+    $guidance = $reading['guidance'];
+    $includesubtopics = $reading['includesubtopics'];
+}
+
+// The reading stopped. Trying again carries on from the last pages it finished.
+if ($status === 'failed') {
+    echo $OUTPUT->notification(get_string('readingfailed', 'local_course_structure',
+        s($reading['error'] ?? '')), 'notifyerror');
+
+    echo '<div class="card mb-4"><div class="card-body">';
+    echo '<p>' . get_string('readingfailedhelp', 'local_course_structure',
+        s($reading['filename'])) . '</p>';
+    echo '<form method="post">';
+    echo '<input type="hidden" name="id" value="' . $courseid . '">';
+    echo '<input type="hidden" name="sesskey" value="' . sesskey() . '">';
+    echo '<input type="hidden" name="retry" value="1">';
+    echo '<input type="hidden" name="guidance" value="' . s($reading['guidance'] ?? '') . '">';
+    echo '<button type="submit" class="btn btn-primary">' .
+         get_string('readingfailedretry', 'local_course_structure') . '</button>';
+    echo '</form>';
+    echo '</div></div>';
+}
+
 // Nothing is created until this is agreed to.
 if (!empty($proposal)) {
-    $SESSION->local_course_structure_proposal = $proposal;
 
     echo '<div class="card"><div class="card-body">';
     echo $OUTPUT->heading(get_string('previewheading', 'local_course_structure'), 4);

@@ -60,6 +60,38 @@ services:
     depends_on:
       - postgresql
 
+  # Runs Moodle's background tasks, such as reading an uploaded book, which can take
+  # far longer than a page can be left loading. Same image and data as moodle, no
+  # ports. Only ad hoc tasks run here: Moodle's scheduled maintenance has never been
+  # switched on for this site, and doing so is a separate decision.
+  cron:
+    image: ai-moodle:4.5-php8.3
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    user: www-data
+    entrypoint:
+      - sh
+      - -c
+      - while true; do php /var/www/html/admin/cli/adhoc_task.php --execute --keep-alive=300; sleep 5; done
+    environment:
+      - MOODLE_DB_HOST=postgresql
+      - MOODLE_DB_PORT=5432
+      - MOODLE_DB_NAME=moodle
+      - MOODLE_DB_USER=moodle
+      - MOODLE_DB_PASSWORD=${DB_PASSWORD}
+      - MOODLE_URL=http://localhost
+    volumes:
+      - moodle_data:/var/moodledata
+      - ./plugins/local_course_structure:/var/www/html/local/course_structure
+      - ./plugins/mod_book:/var/www/html/mod/book
+      - ./uploads.ini:/usr/local/etc/php/conf.d/uploads.ini
+    depends_on:
+      - postgresql
+    restart: unless-stopped
+
   # The only PDF reader: every page of the book is read here, including text that
   # sits inside pictures.
   docling:

@@ -41,14 +41,29 @@ if (!file_exists($bookpath)) {
     $bookfile->copy_content_to($bookpath);
 }
 
+// A book still being read in the background is left to that: reading it here too
+// would double the work and keep this page loading for as long. A book that was
+// stored but never read, from before readings moved to the background, is sent
+// to be read now.
+if (!\mod_book\ai_service::reading_progress($bookfile->get_contenthash())['done']) {
+    $reading = \local_course_structure\reading::get($courseid);
+    if (!in_array($reading['status'] ?? '', array('queued', 'reading'))) {
+        \local_course_structure\reading::start($courseid, $bookfile, '', true);
+    }
+    echo $OUTPUT->notification(get_string('readingnotdone', 'local_course_structure'), 'notifyinfo');
+    echo $OUTPUT->continue_button(new moodle_url('/local/course_structure/index.php',
+        array('id' => $courseid)));
+    echo $OUTPUT->footer();
+    die();
+}
+
 $outline = \mod_book\ai_service::get_outline($bookpath);
 $sections = \mod_book\ai_service::list_sections($outline);
 
-// A presentation covers one chapter only, so there can be no fewer of them than
-// the book has chapters, or a chapter would go without.
+// Any presentation may draw on any section, so even one is enough.
 $chaptercount = count(array_unique(array_column($sections, 'chapterindex')));
 if ($count > 0) {
-    $count = min(max($count, $chaptercount), count($sections));
+    $count = min(max($count, 1), count($sections));
 }
 
 // Match each chapter to the course section carrying its name.
@@ -59,13 +74,21 @@ foreach ($DB->get_records('course_sections', array('course' => $courseid)) as $s
     }
 }
 
+// The course's topics, any of which a presentation can be filed under.
+$coursetopics = array();
+foreach (get_fast_modinfo($course)->get_section_info_all() as $info) {
+    $coursetopics[(int)$info->section] = get_section_name($course, $info);
+}
+
 /**
  * Share the book's sections out over a number of presentations, in book order.
  *
- * A presentation belongs to one chapter and never reaches across two, so the
- * presentations are handed to the chapters first and only then filled. Every
- * chapter keeps at least one, and the spare ones go to whichever chapter is
- * carrying the most sections each time.
+ * This is only the starting point the teacher adjusts. With at least one
+ * presentation per chapter, the presentations are handed to the chapters first
+ * and only then filled: every chapter keeps at least one, and the spare ones go
+ * to whichever chapter is carrying the most sections each time. With fewer,
+ * the sections are simply cut into runs in book order, and a run may cross from
+ * one chapter into the next.
  *
  * @param array $sections Sections as listed by the AI service
  * @param int $count Presentations wanted
@@ -75,6 +98,27 @@ function local_course_structure_spread($sections, $count) {
     $bychapter = array();
     foreach ($sections as $key => $section) {
         $bychapter[$section['chapterindex']][] = $key;
+    }
+
+    if ($count < count($bychapter)) {
+        $keys = array_keys($sections);
+        $base = intdiv(count($keys), $count);
+        $extra = count($keys) % $count;
+        $spread = array();
+        $pos = 0;
+        for ($i = 0; $i < $count; $i++) {
+            $take = $base + ($i < $extra ? 1 : 0);
+            $run = array_slice($keys, $pos, $take);
+            // A run crossing into another chapter is suggested for whichever
+            // chapter holds most of it.
+            $held = array_count_values(array_map(function($key) use ($sections) {
+                return $sections[$key]['chapterindex'];
+            }, $run));
+            arsort($held);
+            $spread[] = array('chapter' => key($held), 'keys' => $run);
+            $pos += $take;
+        }
+        return $spread;
     }
 
     $share = array();
@@ -136,30 +180,21 @@ if ($go && confirm_sesskey()) {
             continue;
         }
 
-        // A presentation belongs to one chapter and is filed under that chapter's
-        // topic. The form offers only one chapter's parts per presentation, so this
-        // stands guard over a request that did not come from the form.
-        $spans = array();
-        foreach ($picked as $key) {
-            if (isset($sections[$key])) {
-                $spans[$sections[$key]['chapterindex']] = true;
-            }
-        }
-        if (count($spans) > 1) {
-            echo $OUTPUT->notification(
-                get_string('mixedchapters', 'local_course_structure', $i + 1), 'notifyerror');
-            echo $OUTPUT->continue_button(new moodle_url('/local/course_structure/lectures.php',
-                array('id' => $courseid)));
-            echo $OUTPUT->footer();
-            die();
-        }
-
         $title = trim(optional_param('title_' . $i, '', PARAM_TEXT));
         if ($title === '') {
             $title = get_string('lecturenumber', 'local_course_structure', $i + 1);
         }
 
-        $groups[] = array('title' => $title, 'sections' => array_values($picked));
+        // The teacher's choice of topic, whichever chapters the sections came from.
+        // Anything that is not one of the course's topics falls back to the topic
+        // named after the first section's chapter.
+        $topic = optional_param('topic_' . $i, -1, PARAM_INT);
+
+        $groups[] = array(
+            'title' => $title,
+            'sections' => array_values($picked),
+            'topic' => isset($coursetopics[$topic]) ? $topic : null,
+        );
     }
 
     $plan = \mod_book\ai_service::plan_from_selection($outline, $groups);
@@ -299,9 +334,14 @@ if ($go && confirm_sesskey()) {
         }
 
         try {
+            $topic = $presentation['topic'] ?? ($sectionof[trim($presentation['chapter'])]
+                ?? ($presentation['chapterindex'] + 1));
+
+            // The deck is labelled with the topic it is filed under, which for a
+            // presentation drawing on several chapters says more than the first.
             $pdfpath = $workdir . '/deck-' . uniqid() . '.pdf';
-            \local_course_structure\slide_deck::render(
-                $presentation['title'], $presentation['chapter'], $slides, $pdfpath);
+            \local_course_structure\slide_deck::render($presentation['title'],
+                $coursetopics[$topic] ?? $presentation['chapter'], $slides, $pdfpath);
 
             $draftid = file_get_unused_draft_itemid();
             $fs->create_file_from_pathname(array(
@@ -320,8 +360,7 @@ if ($go && confirm_sesskey()) {
             $data->course = $course->id;
             $data->modulename = 'resource';
             $data->module = $module->id;
-            $data->section = $sectionof[trim($presentation['chapter'])]
-                ?? ($presentation['chapterindex'] + 1);
+            $data->section = $topic;
             $data->name = $presentation['title'];
             $data->intro = $intro;
             $data->introformat = FORMAT_HTML;
@@ -395,7 +434,13 @@ if ($count > 0) {
     echo '<input type="hidden" name="count" value="' . $count . '">';
     echo '<input type="hidden" name="go" value="1">';
 
-    $lastchapter = null;
+    // The book's sections by chapter, for the collapsible lists in each presentation.
+    $chapters = array();
+    foreach ($sections as $key => $section) {
+        $chapters[$section['chapterindex']]['name'] = $section['chapter'];
+        $chapters[$section['chapterindex']]['keys'][] = $key;
+    }
+
     foreach ($defaults as $i => $entry) {
         $keys = $entry['keys'];
         $ticked = array_fill_keys($keys, true);
@@ -403,18 +448,9 @@ if ($count > 0) {
             ? $sections[$keys[0]]['title']
             : get_string('lecturenumber', 'local_course_structure', $i + 1);
 
-        // The presentations of one chapter are shown together under its name.
-        if ($entry['chapter'] !== $lastchapter) {
-            $chaptername = '';
-            foreach ($sections as $section) {
-                if ($section['chapterindex'] === $entry['chapter']) {
-                    $chaptername = $section['chapter'];
-                    break;
-                }
-            }
-            echo '<h5 class="mt-4">' . s($chaptername) . '</h5>';
-            $lastchapter = $entry['chapter'];
-        }
+        // Suggested topic: the one named after the chapter the sections come from.
+        $chaptername = $chapters[$entry['chapter']]['name'];
+        $suggested = $sectionof[trim($chaptername)] ?? ($entry['chapter'] + 1);
 
         echo '<fieldset class="border rounded p-3 mb-3">';
         echo '<legend class="h6">' .
@@ -427,23 +463,38 @@ if ($count > 0) {
              '" name="title_' . $i . '" value="' . s($default) . '">';
         echo '</div>';
 
-        // Only this chapter's parts are offered, which is what keeps a
-        // presentation from reaching across two chapters of the course.
-        foreach ($sections as $key => $section) {
-            if ($section['chapterindex'] !== $entry['chapter']) {
-                continue;
-            }
+        echo '<div class="form-group">';
+        echo '<label for="topic_' . $i . '">' .
+             get_string('lecturetopic', 'local_course_structure') . '</label>';
+        echo '<select class="form-control" id="topic_' . $i . '" name="topic_' . $i . '">';
+        foreach ($coursetopics as $number => $name) {
+            echo '<option value="' . $number . '"' . ($number === $suggested ? ' selected' : '') .
+                 '>' . s($name) . '</option>';
+        }
+        echo '</select>';
+        echo '</div>';
 
-            $boxid = 'sec_' . $i . '_' . $key;
-            echo '<div class="form-check">';
-            echo '<input type="checkbox" class="form-check-input" id="' . $boxid .
-                 '" name="sec_' . $i . '[]" value="' . $key . '"' .
-                 (isset($ticked[$key]) ? ' checked' : '') . '>';
-            echo '<label class="form-check-label" for="' . $boxid . '">' .
-                 s($section['title']) . ' <span class="text-muted">(' .
-                 get_string('lessonsin', 'local_course_structure',
-                     count($section['lessons'])) . ')</span></label>';
-            echo '</div>';
+        // Every section of the book is on offer, a chapter to a fold. A fold holding
+        // a ticked section starts open, so the suggested split is in view.
+        foreach ($chapters as $chapter) {
+            $open = (bool)array_intersect($chapter['keys'], $keys);
+            echo '<details class="mb-2"' . ($open ? ' open' : '') . '>';
+            echo '<summary>' . s($chapter['name']) . '</summary>';
+            echo '<div class="pl-3 pt-1">';
+            foreach ($chapter['keys'] as $key) {
+                $section = $sections[$key];
+                $boxid = 'sec_' . $i . '_' . $key;
+                echo '<div class="form-check">';
+                echo '<input type="checkbox" class="form-check-input" id="' . $boxid .
+                     '" name="sec_' . $i . '[]" value="' . $key . '"' .
+                     (isset($ticked[$key]) ? ' checked' : '') . '>';
+                echo '<label class="form-check-label" for="' . $boxid . '">' .
+                     s($section['title']) . ' <span class="text-muted">(' .
+                     get_string('lessonsin', 'local_course_structure',
+                         count($section['lessons'])) . ')</span></label>';
+                echo '</div>';
+            }
+            echo '</div></details>';
         }
 
         echo '</fieldset>';
@@ -515,16 +566,15 @@ if (empty($sections)) {
     }
     echo '</ul>';
 
-    echo '<p class="text-muted">' . get_string('onechapteronly', 'local_course_structure',
-        $chaptercount) . '</p>';
+    echo '<p class="text-muted">' . get_string('anysection', 'local_course_structure') . '</p>';
 
     echo '<form method="post" class="form-inline">';
     echo '<input type="hidden" name="id" value="' . $courseid . '">';
     echo '<input type="hidden" name="sesskey" value="' . sesskey() . '">';
     echo '<label class="mr-2" for="count">' .
          get_string('howmany', 'local_course_structure') . '</label>';
-    echo '<input type="number" class="form-control mr-2" id="count" name="count" min="' .
-         $chaptercount . '" max="' . count($sections) . '" value="' . count($sections) .
+    echo '<input type="number" class="form-control mr-2" id="count" name="count" min="1" max="' .
+         count($sections) . '" value="' . count($sections) .
          '" required>';
     echo '<button type="submit" class="btn btn-primary">' .
          get_string('continuetoassign', 'local_course_structure') . '</button>';

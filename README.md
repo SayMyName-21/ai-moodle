@@ -192,6 +192,15 @@ to survive the whole book. Measured on the 128-page textbook, ten-page chunks ru
 Each finished chunk is saved, so an interrupted reading resumes rather than restarting,
 and once the book is read every later use is served from the cache in milliseconds.
 
+**Reading happens in the background.** Uploading a book queues a Moodle ad hoc task
+(`read_book`) and returns at once. The Course structure tab then shows a progress page —
+"Read 140 of 280 pages", with a bar — that refreshes itself, and the review step appears
+when the chapters are ready. The teacher can close the page and come back; if the reading
+fails, the page shows Docling's reason and a *Try again* button that resumes from the last
+finished chunk. The tasks run in the `cron` container, which runs only ad hoc tasks, not
+Moodle's scheduled maintenance. While a book is still being read, the Presentations tab
+says so instead of starting a second reading, and the assistant answers without the book.
+
 Docling also supplies the page count: chunks are read until one comes back short, and a
 chunk starting past the end is answered with the book's length.
 
@@ -427,7 +436,7 @@ Book**. A free Groq key works: <https://console.groq.com>
 
 ```
 ai_moodle/
-├── docker-compose.yaml          Services, pinned project name, volumes
+├── docker-compose.yaml          Services (incl. the cron worker), pinned project name, volumes
 ├── Dockerfile                   Moodle 4.5 on PHP 8.3
 ├── config.php                   Moodle config, all values from the environment
 ├── uploads.ini                  PHP upload limits (256 MB)
@@ -445,6 +454,8 @@ ai_moodle/
     │   ├── locallib.php         Shared helpers and the tab row
     │   └── classes/
     │       ├── chat.php         Assistant: context building, access control
+    │       ├── reading.php      State of a book's background reading
+    │       ├── task/read_book.php  The background task that reads the book
     │       ├── slide_deck.php   Render and parse deck PDFs
     │       ├── pptx_deck.php    Write .pptx as raw OOXML
     │       ├── quiz_builder.php Questions and quizzes into Moodle
