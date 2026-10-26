@@ -41,6 +41,12 @@ class ai_service {
     /** Pages of front matter to search for the table of contents. */
     const FRONT_MATTER_PAGES = 30;
 
+    /**
+     * Pages of back matter to search for the table of contents, where it is just
+     * as often printed in Macedonian textbooks.
+     */
+    const BACK_MATTER_PAGES = 15;
+
     /** Seconds to wait for Docling to answer at all, as opposed to to finish. */
     const DOCLING_CONNECT_TIMEOUT = 5;
 
@@ -85,8 +91,14 @@ class ai_service {
             throw new \moodle_exception('aiprocessingerror', 'mod_book', '', 'Unable to read file content');
         }
 
+        // A PDF's content is already its contents list, found or rebuilt.
+        $toc = (strtolower($filetype) === 'pdf') ? $content : self::extract_toc_section($content);
+        if ($toc === '') {
+            throw new \Exception('No table of contents was found in this file.');
+        }
+
         // Call AI API to extract chapters
-        $chapters = self::call_ai_api($content, $config->ai_api_key,
+        $chapters = self::call_ai_api($content, $toc, $config->ai_api_key,
             $config->ai_provider ?? 'claude', $guidance);
 
         return $chapters;
@@ -108,7 +120,7 @@ class ai_service {
                 break;
 
             case 'pdf':
-                $content = self::extract_pdf_text($filepath);
+                $content = self::book_contents($filepath)['toc'];
                 break;
 
             case 'docx':
@@ -123,26 +135,484 @@ class ai_service {
     }
 
     /**
-     * Extract text from PDF file
+     * A PDF's table of contents, from wherever the book keeps one.
      *
-     * @param string $filepath Path to PDF file
-     * @return string Extracted text
+     * The contents are looked for at the front of the book, then at the back. A
+     * book with neither, or whose contents page is a scan that cannot be read,
+     * has its contents rebuilt from the numbered headings on its own pages. Only
+     * a book with none of these fails: turning the opening pages' text into
+     * chapters line by line gave nonsense rather than an error.
+     *
+     * @param string $filepath Path to the PDF
+     * @return array 'toc', the contents as lines ending in a page number, and
+     *               'printed', whether those are the book's printed page numbers
+     *               rather than the PDF's own
+     * @throws \Exception if the book offers nothing to take its contents from
      */
-    private static function extract_pdf_text($filepath) {
+    private static function book_contents($filepath) {
         // Docling reads a contents table as a table, which is what it is, and the
         // rows come back as lines with the entry at the front - the shape the
         // detection below expects. Read as Markdown instead it arrives wrapped in
         // pipe delimiters, which put a "|" where the chapter label should be and
         // left the detection finding 23 chapters and no sections.
-        $pages = array_slice(self::book_pages($filepath), 0, self::FRONT_MATTER_PAGES);
-        $text = implode("\n", $pages);
+        $pages = self::book_pages($filepath);
 
-        if (trim($text) === '') {
-            throw new \Exception('Docling found no text in the first ' .
-                self::FRONT_MATTER_PAGES . ' pages of this PDF.');
+        // Each place is searched as one text, keyed by the page it starts on.
+        $places = array(1 => array_slice($pages, 0, self::FRONT_MATTER_PAGES));
+        if (count($pages) > self::FRONT_MATTER_PAGES) {
+            $back = max(self::FRONT_MATTER_PAGES, count($pages) - self::BACK_MATTER_PAGES);
+            $places[$back + 1] = array_slice($pages, $back);
+        }
+        // Pages that open a contents list whose entries did not come through.
+        $unread = array();
+        foreach ($places as $first => $place) {
+            $toc = self::extract_toc_section(implode("\n", $place));
+            if (self::has_entries($toc)) {
+                return array('toc' => $toc, 'printed' => true);
+            }
+            foreach ($place as $i => $text) {
+                foreach (preg_split('/\R/u', $text) as $line) {
+                    if (self::is_contents_heading($line)) {
+                        $unread[] = $first + $i;
+                    }
+                }
+            }
         }
 
-        return $text;
+        // Rebuilding asks Docling and the model, so it is done once per book.
+        $cache = make_temp_directory('mod_book/bookpages') . '/' . sha1_file($filepath) . '.contents.json';
+        if (file_exists($cache)) {
+            $cached = json_decode(file_get_contents($cache), true);
+            if (is_array($cached) && !empty($cached['toc'])) {
+                return $cached;
+            }
+        }
+
+        $sections = self::heading_sections($pages);
+        if (empty($sections)) {
+            throw new \Exception('No table of contents could be read in the first ' .
+                self::FRONT_MATTER_PAGES . ' or last ' . self::BACK_MATTER_PAGES .
+                ' pages of this book, and its pages carry no numbered headings (1.1, 1.2 ...) ' .
+                'to rebuild one from.');
+        }
+
+        list($names, $complete) = self::chapter_names($filepath, $pages, $sections, $unread);
+
+        $lines = array();
+        $chapter = 0;
+        foreach ($sections as $section) {
+            if ($section['chapter'] !== $chapter) {
+                $chapter = $section['chapter'];
+                $lines[] = $chapter . '. ' . ($names[$chapter] ??
+                    get_string('aichapternumber', 'mod_book', $chapter)) . '.......... ' . $section['page'];
+            }
+            $lines[] = $section['chapter'] . '.' . $section['section'] . '. ' .
+                $section['title'] . '.......... ' . $section['page'];
+        }
+        $contents = array('toc' => implode("\n", $lines), 'printed' => false);
+
+        // A chapter left without a name because the model could not be reached
+        // gets another chance next time.
+        if ($complete) {
+            file_put_contents($cache, json_encode($contents));
+        }
+        return $contents;
+    }
+
+    /**
+     * Whether a stretch of text found as a contents list holds real entries.
+     *
+     * A contents page that is a scan Docling cannot read still gives its heading,
+     * and the watermark across it, but no entries carrying a page or a number.
+     *
+     * @param string $toc Text found as a contents list
+     * @return bool
+     */
+    private static function has_entries($toc) {
+        $real = 0;
+        foreach (self::toc_entries($toc) as $entry) {
+            if ($entry['page'] > 0 || self::starts_entry($entry['title'])) {
+                $real++;
+            }
+        }
+        return $real >= 3;
+    }
+
+    /**
+     * Rebuild a book's sections from the numbered headings on its pages.
+     *
+     * A section's number shows up on its first page as a heading and again at the
+     * top of each following page as a running header, so where a section starts
+     * can be read from the pages themselves. Display type and italic headers are
+     * what OCR reads worst, though: "1.10" comes back as "1.40" and "4.2" as
+     * "74.2". So the sightings are not taken one by one. The headings kept are
+     * the longest run that climbs through the book in order - the same chapter a
+     * few sections on, or a following chapter near its start - which a misread
+     * number lands outside of, and a section whose number was never read cleanly
+     * is simply missing, its pages going to the section before it.
+     *
+     * @param array $pages Page text, the first entry being page one
+     * @return array Sections in book order, each with its chapter and section
+     *               number, title and PDF page; empty if the pages carry too few
+     *               numbered headings to go by
+     */
+    private static function heading_sections($pages) {
+        $sightings = array();
+        foreach ($pages as $i => $text) {
+            foreach (preg_split('/\R/u', $text) as $k => $line) {
+                if (preg_match('/^(\d{1,2})\.\s?(\d{1,2})\.?\s+(\p{L}.{5,})$/u', trim($line), $match)) {
+                    $sightings[] = array(
+                        'chapter' => (int)$match[1],
+                        'section' => (int)$match[2],
+                        'page' => $i + 1,
+                        // A running header is the first line or two on a page,
+                        // and carries the full title where a heading may wrap.
+                        'header' => $k < 2,
+                        'title' => self::heading_title($match[3]),
+                    );
+                }
+            }
+        }
+
+        // Longest climbing run, counting every sighting along it, so a section
+        // seen on six pages outweighs a misreading seen on one.
+        $count = count($sightings);
+        $length = array();
+        $before = array();
+        for ($j = 0; $j < $count; $j++) {
+            $length[$j] = ($sightings[$j]['section'] <= 3) ? 1 : 0;
+            $before[$j] = null;
+            for ($i = 0; $i < $j; $i++) {
+                if ($length[$i] > 0 && $length[$i] + 1 > $length[$j]
+                        && self::heading_follows($sightings[$i], $sightings[$j])) {
+                    $length[$j] = $length[$i] + 1;
+                    $before[$j] = $i;
+                }
+            }
+        }
+        if (empty($length) || max($length) === 0) {
+            return array();
+        }
+
+        $run = array();
+        for ($j = array_search(max($length), $length, true); $j !== null; $j = $before[$j]) {
+            array_unshift($run, $sightings[$j]);
+        }
+
+        // One entry per section, starting on the page it is first seen.
+        $sections = array();
+        foreach ($run as $sighting) {
+            $key = $sighting['chapter'] . '.' . $sighting['section'];
+            if (!isset($sections[$key])) {
+                $sections[$key] = array('chapter' => $sighting['chapter'],
+                    'section' => $sighting['section'], 'page' => $sighting['page'],
+                    'title' => '', 'header' => false);
+            }
+            // The longest running header has the most of the title; a heading
+            // stands in only for a section that has no header.
+            $current = $sections[$key];
+            if (($sighting['header'] && !$current['header'])
+                    || ($sighting['header'] === $current['header']
+                        && mb_strlen($sighting['title'], 'UTF-8') > mb_strlen($current['title'], 'UTF-8'))) {
+                $sections[$key]['title'] = $sighting['title'];
+                $sections[$key]['header'] = $sighting['header'];
+            }
+        }
+        return (count($sections) >= 3) ? array_values($sections) : array();
+    }
+
+    /**
+     * Whether one numbered heading can come after another in the same book.
+     *
+     * A chapter may be passed over, since one whose every section number was
+     * misread leaves no sightings at all. Without that, the run could not get past
+     * it, and would have to choose between the chapters before it and after.
+     *
+     * @param array $a The earlier sighting
+     * @param array $b The later sighting
+     * @return bool True for the same section again, one up to three further on
+     *              in the same chapter, or one of the first in either of the next
+     *              two chapters
+     */
+    private static function heading_follows($a, $b) {
+        if ($b['page'] < $a['page']) {
+            return false;
+        }
+        if ($b['chapter'] === $a['chapter']) {
+            return $b['section'] >= $a['section'] && $b['section'] - $a['section'] <= 3;
+        }
+        $step = $b['chapter'] - $a['chapter'];
+        return ($step === 1 || $step === 2) && $b['section'] <= 3;
+    }
+
+    /**
+     * Name the chapters of a book whose contents were rebuilt from its pages.
+     *
+     * The name the book gives a chapter is printed in two places: its contents
+     * page and its opening page. Both are tried, the contents page first, as it
+     * is set in body type that OCR reads well once the page is drawn as a picture.
+     * A chapter neither gives a name to is named by the model from its sections.
+     *
+     * @param string $filepath Path to the PDF
+     * @param array $pages Page text, the first entry being page one
+     * @param array $sections Result of heading_sections
+     * @param array $unread PDF pages that open a contents list Docling could not read
+     * @return array Names keyed by chapter number, and whether every chapter got
+     *               one; a chapter left out is to be called by its number
+     */
+    private static function chapter_names($filepath, $pages, $sections, $unread) {
+        // Where each chapter's opening page can be: after the previous chapter's
+        // last section starts, up to where its own first section does.
+        $spans = array();
+        $from = 1;
+        foreach ($sections as $section) {
+            if (!isset($spans[$section['chapter']])) {
+                $spans[$section['chapter']] = array($from, $section['page']);
+            }
+            $from = $section['page'];
+        }
+
+        $names = array();
+        if (!empty($unread)) {
+            try {
+                $names = self::names_from_contents($filepath, $unread, array_keys($spans));
+            } catch (\Exception $e) {
+                // The opening pages and the model are still there to fall back on.
+                $names = array();
+            }
+        }
+
+        foreach ($spans as $number => $span) {
+            if (!isset($names[$number])) {
+                $heading = self::chapter_heading($pages, $number, $span[0], $span[1]);
+                if ($heading !== null) {
+                    $names[$number] = $heading;
+                }
+            }
+        }
+
+        $missing = array_diff(array_keys($spans), array_keys($names));
+        if (!empty($missing)) {
+            $names += self::names_from_model($sections, $names, $missing);
+        }
+
+        return array($names, count($names) === count($spans));
+    }
+
+    /**
+     * Read chapter names off contents pages that Docling could not read directly.
+     *
+     * Such a page is a scan with a watermark that is real text, and Docling drops
+     * every OCR reading lying under real text, which leaves the page empty. Drawn
+     * as a picture without its text, the page is the bare scan, watermark gone,
+     * and reads cleanly. A page that is text rather than a scan would be blank
+     * that way, so if nothing is found it is drawn again with its text.
+     *
+     * @param string $filepath Path to the PDF
+     * @param array $unread PDF pages that open a contents list
+     * @param array $numbers The chapter numbers the book was found to have
+     * @return array Names keyed by chapter number
+     * @throws \Exception if a page cannot be drawn or read
+     */
+    private static function names_from_contents($filepath, $unread, $numbers) {
+        foreach (array(false, true) as $withtext) {
+            $names = self::names_on_pages($filepath, $unread, $numbers, $withtext);
+            if (!empty($names)) {
+                return $names;
+            }
+        }
+        return array();
+    }
+
+    /**
+     * Read chapter names off contents pages drawn as pictures.
+     *
+     * @param string $filepath Path to the PDF
+     * @param array $unread PDF pages that open a contents list
+     * @param array $numbers The chapter numbers the book was found to have
+     * @param bool $withtext Whether to draw the pages' text as well as their images
+     * @return array Names keyed by chapter number
+     * @throws \Exception if a page cannot be drawn or read
+     */
+    private static function names_on_pages($filepath, $unread, $numbers, $withtext) {
+        $total = count(self::book_pages($filepath));
+
+        // A contents list runs on for a page or two past its heading.
+        $lines = array();
+        foreach ($unread as $first) {
+            for ($page = $first; $page <= min($total, $first + 2); $page++) {
+                foreach (self::docling_image(self::draw_page($filepath, $page, $withtext)) as $text) {
+                    $lines = array_merge($lines, preg_split('/\R/u', $text));
+                }
+            }
+        }
+
+        // Chapter entries, set in capitals with a whole number: "2. РОТАЦИОНО
+        // ДВИЖЕЊЕ НА ТВРДО ТЕЛО ........ 53".
+        $found = array();
+        foreach ($lines as $line) {
+            if (!preg_match('/^(\d{1,2})\.\s+(\p{Lu}.*)$/u', trim($line), $match)
+                    || !in_array((int)$match[1], $numbers, true)) {
+                continue;
+            }
+            $title = preg_replace('/\s*\.{3,}.*$/u', '', $match[2]);
+            $title = trim(self::heading_title($title), " \t.,;:-");
+            $letters = preg_replace('/[^\p{L}]/u', '', $title);
+            $capitals = preg_replace('/[^\p{Lu}]/u', '', $title);
+            if (mb_strlen($letters, 'UTF-8') >= 4
+                    && mb_strlen($capitals, 'UTF-8') >= 0.7 * mb_strlen($letters, 'UTF-8')) {
+                $found[] = array('number' => (int)$match[1], 'title' => $title);
+            }
+        }
+
+        // A section number misread as a whole one, such as "1.6." as "6.", is out
+        // of order with the chapters around it. The longest climbing run of
+        // numbers, in the order the page lists them, leaves it out.
+        $count = count($found);
+        $length = array();
+        $before = array();
+        for ($j = 0; $j < $count; $j++) {
+            $length[$j] = 1;
+            $before[$j] = null;
+            for ($i = 0; $i < $j; $i++) {
+                if ($found[$i]['number'] < $found[$j]['number'] && $length[$i] + 1 > $length[$j]) {
+                    $length[$j] = $length[$i] + 1;
+                    $before[$j] = $i;
+                }
+            }
+        }
+
+        $names = array();
+        if ($count > 0) {
+            for ($j = array_search(max($length), $length, true); $j !== null; $j = $before[$j]) {
+                $names[$found[$j]['number']] = $found[$j]['title'];
+            }
+        }
+        return $names;
+    }
+
+    /**
+     * Draw one page of a PDF as a picture.
+     *
+     * @param string $filepath Path to the PDF
+     * @param int $page PDF page number
+     * @param bool $withtext Whether to draw the page's text, or only its images
+     *                       and lines, which for a scan is the scan itself
+     * @return string Path to a PNG, removed when the request ends
+     * @throws \Exception if Ghostscript cannot draw it
+     */
+    private static function draw_page($filepath, $page, $withtext = true) {
+        global $CFG;
+        $gs = !empty($CFG->pathtogs) ? $CFG->pathtogs : '/usr/bin/gs';
+        $png = make_request_directory() . '/page' . (int)$page . '.png';
+
+        // 300 dpi is what Tesseract is tuned for; grey keeps the file small.
+        $command = escapeshellarg($gs) . ' -q -dSAFER -dBATCH -dNOPAUSE -sDEVICE=pnggray -r300' .
+            ($withtext ? '' : ' -dFILTERTEXT') .
+            ' -dFirstPage=' . (int)$page . ' -dLastPage=' . (int)$page .
+            ' -sOutputFile=' . escapeshellarg($png) . ' ' . escapeshellarg($filepath) . ' 2>&1';
+        exec($command, $output, $status);
+
+        if ($status !== 0 || !file_exists($png) || filesize($png) === 0) {
+            throw new \Exception('Ghostscript could not draw page ' . $page . ': ' .
+                implode(' ', array_slice($output, 0, 3)));
+        }
+        return $png;
+    }
+
+    /**
+     * Have the model name chapters from the sections in them.
+     *
+     * The last resort, for a chapter whose name was printed nowhere OCR could
+     * read. The name is the model's, not the book's, so it is only ever used
+     * where the book's own could not be found.
+     *
+     * @param array $sections Result of heading_sections
+     * @param array $known Names already found, keyed by chapter number
+     * @param array $missing Chapter numbers to name
+     * @return array Names keyed by chapter number; empty if the model was no help
+     */
+    private static function names_from_model($sections, $known, $missing) {
+        $outline = '';
+        foreach ($sections as $section) {
+            $number = $section['chapter'];
+            if (strpos($outline, "\nCHAPTER " . $number . ':') === false) {
+                $outline .= "\nCHAPTER " . $number . ': ' .
+                    ($known[$number] ?? '(name unknown)') . "\n";
+            }
+            $outline .= '  ' . $number . '.' . $section['section'] . '. ' . $section['title'] . "\n";
+        }
+
+        $prompt = "Below are the chapters of a textbook with the sections in each. The text " .
+            "was read by OCR, so some letters are misread (in Cyrillic, \"ш\" often stands " .
+            "for \"т\").\n\n" .
+            "Give a title to each chapter whose name is unknown: " . implode(', ', $missing) .
+            ". The title should name what the chapter's sections together cover, in the " .
+            "book's own language and in capitals like the chapter names already known, " .
+            "and be no longer than six words.\n\n" .
+            "Return JSON: {\"chapters\":[{\"number\":3,\"title\":\"...\"}]}\n" .
+            mb_substr($outline, 0, 6000, 'UTF-8');
+
+        try {
+            // The model thinks before it answers, and that comes out of this
+            // budget too: at 800 it ran out after naming two of four chapters.
+            $reply = self::ask_model($prompt, 3000);
+        } catch (\Exception $e) {
+            return array();
+        }
+
+        $names = array();
+        foreach ($reply['chapters'] ?? array() as $item) {
+            $number = (int)($item['number'] ?? 0);
+            $title = trim((string)($item['title'] ?? ''));
+            if (in_array($number, $missing, true) && $title !== ''
+                    && mb_strlen($title, 'UTF-8') <= 120) {
+                $names[$number] = $title;
+            }
+        }
+        return $names;
+    }
+
+    /**
+     * Tidy the title read after a section number.
+     *
+     * @param string $title Text following the number
+     * @return string Title without a page number or a second heading run onto it
+     */
+    private static function heading_title($title) {
+        // OCR sometimes reads a heading twice onto one line: "2.1. КИНЕМАТИКА НА
+        // ТВРДО 2.4. КИНЕМАЛТИКА НА ТВРДО".
+        $title = preg_replace('/\s+\d{1,2}\.\s?\d{1,2}\.\s.*$/u', '', $title);
+        // A running header carries the page number at its end.
+        $title = preg_replace('/\s+\d{1,4}$/u', '', $title);
+        return trim($title);
+    }
+
+    /**
+     * The heading a numbered chapter opens with, if it was read.
+     *
+     * @param array $pages Page text, the first entry being page one
+     * @param int $number Chapter number
+     * @param int $from First page to look on
+     * @param int $to Last page to look on, where its first section starts
+     * @return string|null The chapter's title, or null if no heading was found
+     */
+    private static function chapter_heading($pages, $number, $from, $to) {
+        for ($page = $from; $page <= $to; $page++) {
+            foreach (preg_split('/\R/u', $pages[$page - 1] ?? '') as $line) {
+                if (!preg_match('/^' . $number . '\.\s+(\p{L}.{3,})$/u', trim($line), $match)) {
+                    continue;
+                }
+                // A chapter heading is set in capitals, which tells it apart from
+                // a numbered point in the running text.
+                $letters = preg_replace('/[^\p{L}]/u', '', $match[1]);
+                $capitals = preg_replace('/[^\p{Lu}]/u', '', $match[1]);
+                if (mb_strlen($capitals, 'UTF-8') >= 0.7 * mb_strlen($letters, 'UTF-8')) {
+                    return self::heading_title($match[1]);
+                }
+            }
+        }
+        return null;
     }
 
     /**
@@ -344,12 +814,43 @@ class ai_service {
      * @throws \Exception if Docling could not be reached or the task did not finish
      */
     private static function docling_convert($filepath, $from, $to) {
+        return self::docling_task($filepath, 'book.pdf', 'pages ' . $from . '-' . $to,
+            array('page_range' => array((int)$from, (int)$to)));
+    }
+
+    /**
+     * Have Docling read a picture, such as a page drawn by draw_page().
+     *
+     * @param string $imagepath Path to the PNG
+     * @return array Text of the picture, as the only entry
+     * @throws \Exception if Docling cannot read it
+     */
+    private static function docling_image($imagepath) {
+        $result = self::docling_task($imagepath, 'page.png', 'the page image', array());
+
+        $document = $result['document']['json_content'] ?? null;
+        if (($result['status'] ?? '') !== 'success' || !is_array($document)) {
+            throw new \Exception('Docling could not read the page image.');
+        }
+        return self::pages_from_document($document, 1);
+    }
+
+    /**
+     * Submit a file to Docling as a task, wait for it and return the answer.
+     *
+     * @param string $filepath Path to the file
+     * @param string $filename Name to give it, whose extension says what it is
+     * @param string $what What is being read, for messages
+     * @param array $options Options beyond the reading ones every task shares
+     * @return array Docling's result, which may itself report a failure
+     * @throws \Exception if Docling could not be reached or the task did not finish
+     */
+    private static function docling_task($filepath, $filename, $what, $options) {
         $config = get_config('book');
         $url = rtrim(!empty($config->docling_url) ? $config->docling_url
             : 'http://docling:5001', '/');
         $timeout = (int)(!empty($config->docling_timeout) ? $config->docling_timeout : 300);
         $ocrlang = !empty($config->docling_ocrlang) ? $config->docling_ocrlang : 'mkd';
-        $range = $from . '-' . $to;
 
         // Tesseract is the only engine Docling offers with a Macedonian model, so
         // it is asked for by name rather than left to automatic selection, which
@@ -357,21 +858,20 @@ class ai_service {
         // real text layer with a worse reading of it. The structured form keeps
         // tables as tables and says which page each piece of wording came from.
         $task = self::docling_request($url . '/v1/convert/source/async', array(
-            'options' => array(
+            'options' => array_merge(array(
                 'to_formats' => array('json'),
                 'do_ocr' => true,
                 'ocr_preset' => 'tesserocr',
                 'ocr_lang' => explode('+', $ocrlang),
-                'page_range' => array((int)$from, (int)$to),
-            ),
+            ), $options),
             'sources' => array(array(
                 'kind' => 'file',
-                'filename' => 'book.pdf',
+                'filename' => $filename,
                 'base64_string' => base64_encode(file_get_contents($filepath)),
             )),
         ));
         if (empty($task['task_id'])) {
-            throw new \Exception('Docling at ' . $url . ' did not accept pages ' . $range . '.');
+            throw new \Exception('Docling at ' . $url . ' did not accept ' . $what . '.');
         }
         $taskid = rawurlencode($task['task_id']);
 
@@ -388,12 +888,12 @@ class ai_service {
         if ($state !== 'success') {
             $why = !empty($status['error_message']) ? $status['error_message']
                 : ($state === '' ? 'no answer' : 'still ' . $state . ' after ' . $timeout . 's');
-            throw new \Exception('Docling could not read pages ' . $range . ': ' . $why);
+            throw new \Exception('Docling could not read ' . $what . ': ' . $why);
         }
 
         $result = self::docling_request($url . '/v1/result/' . $taskid);
         if ($result === null) {
-            throw new \Exception('Docling finished pages ' . $range . ' but returned no result.');
+            throw new \Exception('Docling finished ' . $what . ' but returned no result.');
         }
 
         return $result;
@@ -521,7 +1021,8 @@ class ai_service {
      * @return array offset, total pages, and chapters each holding their subtopics
      */
     public static function get_outline($filepath) {
-        $toc = self::extract_toc_section(self::extract_pdf_text($filepath));
+        $contents = self::book_contents($filepath);
+        $toc = $contents['toc'];
         $structure = self::detect_main_chapters($toc);
 
         // Tier three means the book names its chapters neither by label nor by
@@ -543,7 +1044,8 @@ class ai_service {
         $mains = $structure['titles'];
 
         $total = self::pdf_page_count($filepath);
-        $offset = self::detect_page_offset($filepath, $entries);
+        // Contents rebuilt from the pages already give the PDF's own page numbers.
+        $offset = $contents['printed'] ? self::detect_page_offset($filepath, $entries) : 0;
 
         // An entry runs until the page before the next one starts.
         $count = count($entries);
@@ -1216,7 +1718,7 @@ class ai_service {
      * Isolate the table of contents from the surrounding front matter.
      *
      * @param string $text Extracted PDF text
-     * @return string The table of contents
+     * @return string The table of contents, or '' if there is none
      */
     private static function extract_toc_section($text) {
         $lines = preg_split('/\R/u', $text);
@@ -1254,7 +1756,7 @@ class ai_service {
             }
         }
 
-        return mb_substr($text, 0, 6000, 'UTF-8');
+        return '';
     }
 
     /**
@@ -1845,15 +2347,16 @@ class ai_service {
      * Call AI API to extract chapters
      *
      * @param string $content Book content
+     * @param string $toc The book's table of contents
      * @param string $apikey API key (not used for Ollama)
      * @param string $provider AI provider (ollama, claude, openai)
      * @return array Array of chapters
      */
-    private static function call_ai_api($content, $apikey, $provider = 'groq', $guidance = '') {
+    private static function call_ai_api($content, $toc, $apikey, $provider = 'groq', $guidance = '') {
         if ($provider === 'groq') {
-            return self::call_groq_api($content, $apikey, $guidance);
+            return self::call_groq_api($toc, $apikey, $guidance);
         } else if ($provider === 'ollama') {
-            return self::call_ollama_api($content);
+            return self::call_ollama_api($toc);
         } else if ($provider === 'claude') {
             return self::call_claude_api($content, $apikey);
         } else if ($provider === 'openai') {
@@ -1866,15 +2369,14 @@ class ai_service {
     /**
      * Call Groq API to extract chapters (free tier, fast, open-source models)
      *
-     * @param string $content Book content
+     * @param string $toc The book's table of contents
      * @param string $apikey Groq API key
      * @return array Array of chapters
      */
-    private static function call_groq_api($content, $apikey, $guidance = '') {
+    private static function call_groq_api($toc, $apikey, $guidance = '') {
         $config = get_config('book');
         $model = $config->groq_model ?? 'openai/gpt-oss-120b';
 
-        $toc = self::extract_toc_section($content);
         $structure = self::detect_main_chapters($toc);
 
         $data = [
@@ -1924,15 +2426,14 @@ class ai_service {
     /**
      * Call Ollama API to extract chapters (free, open-source, local)
      *
-     * @param string $content Book content
+     * @param string $toc The book's table of contents
      * @return array Array of chapters
      */
-    private static function call_ollama_api($content) {
+    private static function call_ollama_api($toc) {
         $config = get_config('book');
         $ollamaurl = $config->ollama_url ?? 'http://host.docker.internal:11434';
         $ollamamodel = $config->ollama_model ?? 'llama3';
 
-        $toc = self::extract_toc_section($content);
         $structure = self::detect_main_chapters($toc);
 
         $prompt = self::build_chapter_prompt($toc);

@@ -132,6 +132,7 @@ $string['aiprocessing'] = 'AI is processing your book...';
 $string['aiprocessingcomplete'] = 'AI processing complete. {$a} course sections created from book chapters.';
 $string['aiprocessingerror'] = 'Error processing book with AI: {$a}';
 $string['aiapikeynotset'] = 'AI API key not configured. Please contact your site administrator.';
+$string['aichapternumber'] = 'Chapter {$a}';
 
 // AI Settings.
 $string['aisettings'] = 'AI Settings';
