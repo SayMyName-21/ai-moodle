@@ -1363,6 +1363,89 @@ class ai_service {
             $lastcall = time();
         }
 
+        $result = self::model_request($url, $payload, $headers);
+        $text = ($provider === 'ollama')
+            ? ($result['response'] ?? '')
+            : ($result['choices'][0]['message']['content'] ?? '');
+
+        $decoded = json_decode($text, true);
+        if (!is_array($decoded)) {
+            throw new \Exception('AI reply was not JSON: ' . substr($text, 0, 300));
+        }
+        return $decoded;
+    }
+
+    /**
+     * Take one turn of a conversation in which the model may call tools.
+     *
+     * Unlike ask_model() the calls are not spaced out in advance: a conversation
+     * with tools takes several short turns, and waiting the full spacing before
+     * each would leave the teacher watching for minutes. A refusal for going too
+     * fast is waited out instead, for as long as the service says.
+     *
+     * @param array $messages The conversation so far, in chat completion form
+     * @param array $tools Tool definitions, in chat completion form
+     * @param int $maxtokens Reply budget, which the model's thinking also comes out of
+     * @return array The model's message: 'content', and 'tool_calls' if it called any
+     * @throws \Exception if the request fails
+     */
+    public static function chat_with_tools($messages, $tools, $maxtokens = 3000) {
+        $config = get_config('book');
+        $provider = $config->ai_provider ?? 'groq';
+
+        // Ollama answers tool calls through its chat completion endpoint, in the
+        // same form as Groq, so one conversation serves both.
+        if ($provider === 'ollama') {
+            $url = ($config->ollama_url ?? 'http://host.docker.internal:11434') . '/v1/chat/completions';
+            $model = $config->ollama_model ?? 'llama3';
+            $headers = array('Content-Type: application/json');
+        } else {
+            $url = 'https://api.groq.com/openai/v1/chat/completions';
+            $model = $config->groq_model ?? 'openai/gpt-oss-120b';
+            $headers = array(
+                'Content-Type: application/json',
+                'Authorization: Bearer ' . ($config->ai_api_key ?? ''),
+            );
+        }
+
+        $payload = array(
+            'model' => $model,
+            'messages' => $messages,
+            'tools' => $tools,
+            'tool_choice' => 'auto',
+            // Changes to a course should follow the request as literally as possible.
+            'temperature' => 0,
+            'max_tokens' => $maxtokens,
+        );
+
+        // A tool call the model wrote badly is refused outright, and the same
+        // request usually comes back well formed the second time.
+        try {
+            $result = self::model_request($url, $payload, $headers);
+        } catch (\Exception $e) {
+            if (strpos($e->getMessage(), 'tool_use_failed') === false) {
+                throw $e;
+            }
+            $result = self::model_request($url, $payload, $headers);
+        }
+
+        $message = $result['choices'][0]['message'] ?? null;
+        if (!is_array($message)) {
+            throw new \Exception('The AI service returned no message.');
+        }
+        return $message;
+    }
+
+    /**
+     * Send one request to the model, waiting out per-minute refusals.
+     *
+     * @param string $url Endpoint
+     * @param array $payload JSON body
+     * @param array $headers HTTP headers
+     * @return array The decoded answer
+     * @throws \Exception if the request fails or the daily allowance is spent
+     */
+    private static function model_request($url, $payload, $headers) {
         $response = '';
         $httpcode = 0;
         $backoff = array(25, 40, 60);
@@ -1386,27 +1469,63 @@ class ai_service {
             }
 
             if ($httpcode === 429 && isset($backoff[$attempt])) {
-                sleep($backoff[$attempt]);
+                // Groq says how long to wait ("Please try again in 7.66s"), which is
+                // usually far less than the fixed backoff.
+                $wait = preg_match('/try again in (?:(\d+)m)?([\d.]+)s/', (string)$response, $match)
+                    ? (int)ceil(((int)$match[1]) * 60 + (float)$match[2]) + 1 : $backoff[$attempt];
+                sleep(min($wait, $backoff[$attempt] + 20));
                 continue;
             }
             break;
         }
 
         if ($httpcode !== 200) {
-            throw new \Exception('AI request failed with HTTP ' . $httpcode . '. ' .
-                substr((string)$response, 0, 300));
+            throw self::request_failure($httpcode, $response);
         }
 
         $result = json_decode($response, true);
-        $text = ($provider === 'ollama')
-            ? ($result['response'] ?? '')
-            : ($result['choices'][0]['message']['content'] ?? '');
+        return is_array($result) ? $result : array();
+    }
 
-        $decoded = json_decode($text, true);
-        if (!is_array($decoded)) {
-            throw new \Exception('AI reply was not JSON: ' . substr($text, 0, 300));
+    /**
+     * A failed request to the AI service, put in a sentence for a teacher.
+     *
+     * The service's own reply goes to the server log for whoever runs the site.
+     * It is no use to a teacher, and it names the account it belongs to - Groq's
+     * gives the organisation id - so it is not passed on.
+     *
+     * @param int $httpcode Status the service answered with, 0 if none
+     * @param string|false $response Its reply
+     * @return \Exception
+     */
+    private static function request_failure($httpcode, $response) {
+        $response = (string)$response;
+        error_log('AI request failed with HTTP ' . $httpcode . ': ' . substr($response, 0, 2000));
+
+        if ($httpcode === 413 || preg_match('/too large|context length|maximum context/i', $response)) {
+            $message = 'The request was too large for the AI service. Try asking for less at once.';
+        } else if ($httpcode === 429) {
+            $message = 'The AI service is busy. Wait a minute and try again.';
+        } else if ($httpcode === 401 || $httpcode === 403) {
+            $message = 'The AI service did not accept the API key. Ask the site administrator ' .
+                'to check the AI settings.';
+        } else if ($httpcode === 0) {
+            $message = 'The AI service could not be reached. Try again later.';
+        } else if ($httpcode >= 500) {
+            $message = 'The AI service had a problem (HTTP ' . $httpcode . '). Try again later.';
+        } else {
+            $message = 'The AI request failed (HTTP ' . $httpcode . ').';
         }
-        return $decoded;
+
+        // The service's error code is kept: it says nothing about the account, and
+        // a badly written tool call is retried on the strength of it.
+        $error = json_decode($response, true)['error'] ?? null;
+        $code = is_array($error) ? (string)($error['code'] ?? '') : '';
+        if (preg_match('/^[a-z_]{1,40}$/', $code)) {
+            $message .= ' (' . $code . ')';
+        }
+
+        return new \Exception($message);
     }
 
     /**
@@ -2406,8 +2525,7 @@ class ai_service {
         curl_close($ch);
 
         if ($httpcode !== 200) {
-            $error_response = substr($response, 0, 500);
-            throw new \Exception('Groq API request failed with HTTP ' . $httpcode . '. Response: ' . $error_response);
+            throw self::request_failure($httpcode, $response);
         }
 
         $result = json_decode($response, true);
@@ -2459,8 +2577,7 @@ class ai_service {
         curl_close($ch);
 
         if ($httpcode !== 200) {
-            $error_response = substr($response, 0, 500);
-            throw new \Exception('Ollama request failed with HTTP ' . $httpcode . '. Response: ' . $error_response);
+            throw self::request_failure($httpcode, $response);
         }
 
         $result = json_decode($response, true);

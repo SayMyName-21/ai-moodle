@@ -105,7 +105,16 @@ class chat {
             $material = \core_text::substr($material, 0, self::CONTEXT_CHARS);
         }
 
-        $prompt = ($teacher ? self::teacher_prompt() : self::student_prompt()) .
+        // A teacher's assistant can also change the course, which takes a
+        // conversation with tools rather than a single question and answer.
+        if ($teacher) {
+            require_once(__DIR__ . '/course_agent.php');
+            $result = course_agent::run($course, $context, $question, self::teacher_prompt(), $material);
+            return array('answer' => $result['answer'], 'used' => $used, 'teacher' => true,
+                'plan' => $result['plan']);
+        }
+
+        $prompt = self::student_prompt() .
             "\n\n=== COURSE: " . $course->fullname . " ===\n" . $material .
             "\n\n=== QUESTION ===\n" . \core_text::substr($question, 0, 1000);
 
@@ -116,7 +125,7 @@ class chat {
             throw new \Exception(get_string('chatnoanswer', 'local_course_structure'));
         }
 
-        return array('answer' => $answer, 'used' => $used, 'teacher' => $teacher);
+        return array('answer' => $answer, 'used' => $used, 'teacher' => false, 'plan' => null);
     }
 
     /**
@@ -158,8 +167,7 @@ class chat {
             "questions are weak, what a lecture is missing, what to teach next. " .
             "Answer those. Form a view from the material, give your reasons, and make " .
             "clear that it is your judgement and not something the course states. " .
-            "Declining to judge is not useful to them.\n\n" .
-            "Return JSON: {\"answer\":\"...\"}";
+            "Declining to judge is not useful to them.";
     }
 
     /**
@@ -437,7 +445,14 @@ class chat {
      * @return bool
      */
     private static function covered($question, $material) {
-        $words = self::keywords($question);
+        // A word in a script the material hardly uses could never be found in it,
+        // so it says nothing about coverage: a teacher asking in English about a
+        // Macedonian course otherwise had the book opened for every request.
+        $scripts = self::scripts($material);
+        $words = array_filter(self::keywords($question), function($word) use ($scripts) {
+            $script = self::script_of($word);
+            return $script === null || in_array($script, $scripts, true);
+        });
         if (empty($words)) {
             return true;
         }
@@ -517,6 +532,50 @@ class chat {
         }
 
         return \core_text::substr($excerpt, 0, self::BOOK_CHARS);
+    }
+
+    /** Scripts told apart when judging coverage. */
+    const SCRIPTS = array('Cyrillic', 'Latin', 'Greek', 'Arabic', 'Hebrew');
+
+    /** Share of the material's letters a script needs to count as its own. */
+    const SCRIPT_SHARE = 0.2;
+
+    /**
+     * The scripts a text is mostly written in.
+     *
+     * The material quotes some English - quiz names, further reading - in a
+     * Macedonian course, so a script counts only once it is a fair share.
+     *
+     * @param string $text The text
+     * @return array Script names
+     */
+    private static function scripts($text) {
+        $counts = array();
+        foreach (self::SCRIPTS as $script) {
+            $counts[$script] = preg_match_all('/\p{' . $script . '}/u', $text);
+        }
+        $total = array_sum($counts);
+        if ($total === 0) {
+            return array();
+        }
+        return array_keys(array_filter($counts, function($count) use ($total) {
+            return $count / $total >= self::SCRIPT_SHARE;
+        }));
+    }
+
+    /**
+     * The script a word is written in.
+     *
+     * @param string $word The word
+     * @return string|null Script name, or null for one not told apart
+     */
+    private static function script_of($word) {
+        foreach (self::SCRIPTS as $script) {
+            if (preg_match('/\p{' . $script . '}/u', $word)) {
+                return $script;
+            }
+        }
+        return null;
     }
 
     /**

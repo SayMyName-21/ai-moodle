@@ -59,7 +59,7 @@ function local_course_structure_extend_navigation_course($navigation, $course, $
  *
  * @return string Markup for the widget, or nothing where it does not belong
  */
-function local_course_structure_before_footer() {
+function local_course_structure_chat_widget() {
     global $PAGE, $COURSE, $CFG;
 
     if (!isloggedin() || isguestuser() || during_initial_install()) {
@@ -98,9 +98,16 @@ function local_course_structure_before_footer() {
         'send' => get_string('chatsend', 'local_course_structure'),
         'open' => get_string('chatopen', 'local_course_structure'),
         'close' => get_string('chatclose', 'local_course_structure'),
-        'thinking' => get_string('chatthinking', 'local_course_structure'),
+        'thinking' => get_string($teacher ? 'chatworking' : 'chatthinking', 'local_course_structure'),
         'failed' => get_string('chatfailed', 'local_course_structure'),
         'frombook' => get_string('chatfrombook', 'local_course_structure'),
+        'planintro' => get_string('chatplanintro', 'local_course_structure'),
+        'apply' => get_string('chatapply', 'local_course_structure'),
+        'discard' => get_string('chatdiscard', 'local_course_structure'),
+        'applying' => get_string('chatapplying', 'local_course_structure'),
+        'applied' => get_string('chatapplied', 'local_course_structure'),
+        'discarded' => get_string('chatdiscarded', 'local_course_structure'),
+        'reload' => get_string('chatreload', 'local_course_structure'),
     );
 
     $config = json_encode(array(
@@ -116,7 +123,7 @@ function local_course_structure_before_footer() {
 #lcs-chat-btn{position:fixed;right:20px;bottom:20px;z-index:1040;border:0;border-radius:50%;
  width:56px;height:56px;font-size:24px;cursor:pointer;background:#0f6cbf;color:#fff;
  box-shadow:0 2px 10px rgba(0,0,0,.3)}
-#lcs-chat-panel{position:fixed;right:20px;bottom:86px;z-index:1040;width:360px;max-width:calc(100vw - 40px);
+#lcs-chat-panel{position:fixed;right:20px;bottom:86px;z-index:1040;width:420px;max-width:calc(100vw - 40px);
  max-height:70vh;display:none;flex-direction:column;background:#fff;border:1px solid #ccc;
  border-radius:8px;box-shadow:0 2px 16px rgba(0,0,0,.25);overflow:hidden}
 #lcs-chat-panel.lcs-open{display:flex}
@@ -128,6 +135,19 @@ function local_course_structure_before_footer() {
 #lcs-chat-form{display:flex;border-top:1px solid #ddd;flex:0 0 auto}
 #lcs-chat-q{flex:1;border:0;padding:10px;font:inherit;resize:none;height:44px}
 #lcs-chat-send{border:0;background:#0f6cbf;color:#fff;padding:0 14px;cursor:pointer}
+#lcs-chat-log .lcs-plan{border:1px solid #cfe2f3;background:#f3f8fd;border-radius:6px;padding:8px 10px;margin:0 0 10px}
+#lcs-chat-log .lcs-plan ul{margin:0 0 8px;padding-left:18px}
+#lcs-chat-log .lcs-details{font-size:12px;color:#555;white-space:pre-wrap;margin:2px 0 6px}
+#lcs-chat-log .lcs-answer{margin:0 0 10px}
+#lcs-chat-log .lcs-answer h1,#lcs-chat-log .lcs-answer h2,#lcs-chat-log .lcs-answer h3,
+#lcs-chat-log .lcs-answer h4{font-size:15px;font-weight:600;margin:12px 0 6px}
+#lcs-chat-log .lcs-answer ul,#lcs-chat-log .lcs-answer ol{margin:0 0 10px;padding-left:20px}
+#lcs-chat-log .lcs-answer li{margin:0 0 3px}
+#lcs-chat-log .lcs-answer table{display:block;overflow-x:auto;border-collapse:collapse;
+ font-size:12px;margin:0 0 10px}
+#lcs-chat-log .lcs-answer th,#lcs-chat-log .lcs-answer td{border:1px solid #ccc;padding:4px 6px;
+ vertical-align:top;min-width:70px}
+#lcs-chat-log .lcs-answer th{background:#f3f3f3}
 </style>
 <script>
 (function(){
@@ -163,6 +183,11 @@ function local_course_structure_before_footer() {
   log.appendChild(p);log.scrollTop=log.scrollHeight;
   return p;
  }
+ // An answer arrives as HTML the server has already cleaned.
+ function answer(html){
+  var div=document.createElement("div");div.className="lcs-answer";div.innerHTML=html;
+  log.appendChild(div);log.scrollTop=log.scrollHeight;
+ }
  say("",s.intro,"lcs-note");
 
  btn.addEventListener("click",function(){
@@ -180,24 +205,83 @@ function local_course_structure_before_footer() {
   q.value="";q.disabled=true;
   var pending=say("",s.thinking,"lcs-note");
 
-  var body=new URLSearchParams();
-  body.append("id",cfg.courseid);
-  body.append("sesskey",cfg.sesskey);
-  body.append("question",text);
-
-  fetch(cfg.url,{method:"POST",credentials:"same-origin",
-   headers:{"Content-Type":"application/x-www-form-urlencoded; charset=UTF-8"},
-   body:body.toString()})
-  .then(function(r){return r.json();})
+  post({question:text})
   .then(function(d){
    pending.remove();
    if(d && d.error){say("",d.error,"lcs-note");return;}
-   say("",d.answer);
+   answer(d.answer);
    if(d.used && d.used.indexOf("book")!==-1){say("",s.frombook,"lcs-note");}
+   if(d.plan){showplan(d.plan);}
   })
   .catch(function(){pending.remove();say("",s.failed,"lcs-note");})
   .then(function(){q.disabled=false;q.focus();});
  });
+
+ // Enter sends, as in any chat; Shift+Enter starts a new line. Not while an
+ // input method is still composing a word, where Enter picks the word.
+ q.addEventListener("keydown",function(e){
+  if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing&&!q.disabled){
+   e.preventDefault();
+   panel.querySelector("#lcs-chat-form").requestSubmit();
+  }
+ });
+
+ function post(params){
+  var body=new URLSearchParams();
+  body.append("id",cfg.courseid);
+  body.append("sesskey",cfg.sesskey);
+  for(var k in params){body.append(k,params[k]);}
+  return fetch(cfg.url,{method:"POST",credentials:"same-origin",
+   headers:{"Content-Type":"application/x-www-form-urlencoded; charset=UTF-8"},
+   body:body.toString()})
+  .then(function(r){return r.json();});
+ }
+
+ // Changes the assistant proposes wait here until the teacher decides on them.
+ function showplan(plan){
+  var box=document.createElement("div");box.className="lcs-plan";
+  var head=document.createElement("p");head.className="lcs-note";head.textContent=s.planintro;
+  box.appendChild(head);
+  var list=document.createElement("ul");
+  plan.changes.forEach(function(change){
+   var li=document.createElement("li");li.textContent=change.summary;
+   if(change.details){
+    var more=document.createElement("div");more.className="lcs-details";more.textContent=change.details;
+    li.appendChild(more);
+   }
+   list.appendChild(li);
+  });
+  box.appendChild(list);
+  var row=document.createElement("div");
+  var yes=document.createElement("button");yes.type="button";yes.className="btn btn-primary btn-sm";
+  yes.textContent=s.apply;
+  var no=document.createElement("button");no.type="button";no.className="btn btn-secondary btn-sm ml-2";
+  no.textContent=s.discard;
+  row.appendChild(yes);row.appendChild(no);box.appendChild(row);
+  log.appendChild(box);log.scrollTop=log.scrollHeight;
+
+  function decide(decision){
+   yes.disabled=true;no.disabled=true;
+   var waiting=(decision==="apply")?say("",s.applying,"lcs-note"):null;
+   post({decision:decision,plan:plan.id})
+   .then(function(d){
+    if(waiting){waiting.remove();}
+    row.remove();
+    if(d && d.error){say("",d.error,"lcs-note");return;}
+    if(!d.applied){say("",s.discarded,"lcs-note");return;}
+    say("",s.applied+" "+d.applied.join("; "));
+    var p=document.createElement("p");var a=document.createElement("a");
+    a.href=location.href;a.textContent=s.reload;p.appendChild(a);
+    log.appendChild(p);log.scrollTop=log.scrollHeight;
+   })
+   .catch(function(){
+    if(waiting){waiting.remove();}
+    yes.disabled=false;no.disabled=false;say("",s.failed,"lcs-note");
+   });
+  }
+  yes.addEventListener("click",function(){decide("apply");});
+  no.addEventListener("click",function(){decide("discard");});
+ }
 })();
 </script>';
 }

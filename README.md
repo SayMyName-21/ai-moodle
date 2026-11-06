@@ -123,7 +123,9 @@ because no links beats wrong links.
 ### 7. Course assistant
 
 A chat widget in the bottom-right corner of course pages, described in its own section
-below.
+below. For teachers it can also change the course, showing every change for approval first,
+and write material for the teacher — a lesson plan for a lecture, say — that it can then save
+into the course as a page hidden from students.
 
 ---
 
@@ -244,7 +246,11 @@ and letting the importer deal with that is far safer than writing those rows dir
 
 ## The course assistant and its access model
 
-A floating widget injected through the `before_footer` hook, on course pages only.
+A floating widget added through Moodle's `before_footer_html_generation` hook, on course pages only.
+
+The model answers in Markdown. `chat.php` renders it with Moodle's `format_text()`
+(`FORMAT_MARKDOWN`), which also cleans the HTML, so tables, headings and lists show as such
+in the widget. Enter sends a question; Shift+Enter starts a new line.
 
 ### Two different assistants
 
@@ -287,12 +293,65 @@ group rules are respected without reimplementing them.
   the lecture says about the question in front of them. Teachers keep it there, since the
   question bank is one of the things it is for.
 - **The book is consulted only when the lectures fall short**, decided by keyword coverage —
-  it saves time and allowance, and the lectures were written from the book anyway.
+  it saves time and allowance, and the lectures were written from the book anyway. Words in
+  a script the material hardly uses are left out of the test: an English request about a
+  Macedonian course could never match them, and used to open the book every time.
 - **Lecture content is selected by relevance**, not course order. A course has far more
   lecture text than fits in one request, so sending it in order would make only the opening
   topics answerable.
 - **A per-person daily cap** (default 40 questions) stops one user spending the whole daily
   AI allowance that lecture generation also depends on.
+
+### Changing the course (teachers)
+
+A teacher can ask the assistant to change the course — *"hide the atmosphere quiz and let
+the lithosphere quiz open on 20 November at 9:00 with a 30-minute limit"* — and it proposes
+the changes, each with a one-line summary **and its actual content** (setting values, page
+text, questions with the right answer marked, function arguments). **Nothing changes until
+the teacher presses Apply.**
+
+- **It runs as the teacher.** Every change goes through Moodle's own permission checks for
+  the logged-in user, so the assistant can do exactly what that teacher could do by hand —
+  in this course or any other they teach — and nothing more. Asked to delete a site admin,
+  it is refused at Apply with Moodle's *"you do not have permissions"*.
+- **Checked before it is offered.** A web-service change is refused while it is being
+  proposed if the teacher holds none of the permissions the function declares, or it names
+  a course they cannot access, so the assistant says no instead of showing an Apply button
+  that would fail. Functions that declare no permissions are still checked by Moodle at
+  Apply. Passwords are never proposed: a new user gets one Moodle makes and emails.
+  Verified with a plain editing-teacher account, which could not create users or change a
+  course it was not enrolled in.
+- **All or nothing.** The approved changes run in one database transaction; if any fails,
+  all are taken back and the teacher is told which one and why.
+- **Tried before it is shown.** Each proposed activity, setting, topic or question change is
+  made and rolled back as it is proposed, so a mistake reaches the model, which can correct
+  it, rather than the teacher.
+- **Saved word for word.** Asked to save something it wrote earlier — *"save that lesson plan
+  as a page in topic 1"* — the assistant proposes a page whose text is taken from the answer
+  the teacher read, kept whole in the session, not retyped by the model from memory. Such a
+  page is hidden from students unless the teacher says otherwise.
+- **Students never get tools.** Their questions take the read-only path above.
+
+How it reaches Moodle (`classes/course_agent.php`), via the model's function calling:
+
+| Tool | Built on |
+|---|---|
+| Find / describe / read / propose any web-service function | Moodle's 759 external functions, run in-process as the teacher — the same coverage an MCP server would give |
+| Activity settings (dates, time limit, attempts, description…) | `get_moduleinfo_data` + the module's own form defaults → `update_moduleinfo`, as Moodle's edit page does, so calendar events and grade items follow |
+| New activity of any type, with questions for a quiz | `prepare_new_moduleinfo_data` + form defaults → `add_moduleinfo` |
+| Save an earlier answer as a page | The same, with the answer's Markdown turned into cleaned HTML |
+| Rename a topic or change its description | `course_update_section` |
+| Questions into a quiz | GIFT import via `quiz_builder` |
+
+Web-service functions alone could not create activities, change a quiz's settings, write
+questions or rename a topic in Moodle 4.5, which is why those have tools of their own and
+why this is built into the assistant rather than run through an MCP server.
+
+A request that changes things takes several turns with the model, and on the free tier that
+means 30 seconds to a few minutes — about two and a half for two changes in one request. The model reads Macedonian imperfectly: it has twice applied a setting
+asked for one quiz to both quizzes named in the same sentence. The approval step, with the
+content of each change visible, is what catches that, and it will also show invented content
+(it has made up book titles for a reading list when asked for suggestions).
 
 ---
 
@@ -332,6 +391,13 @@ reply together, and **200,000 per day**. Consequences visible throughout the cod
 - A run that stops part way through is resumable: anything already built is kept and only
   the gaps are filled.
 - Revision returns edits, not whole presentations.
+- The assistant's course material is sized to fill a request on its own, so on a teacher's
+  follow-up the room taken by earlier exchanges comes out of the material.
+
+When a provider refuses a request, the user is told why in a sentence — too large, busy,
+key not accepted, unreachable — and the provider's own reply goes to the PHP error log
+(`docker compose logs moodle`). It is not shown, since Groq's names the organisation the
+key belongs to.
 - The assistant has its own per-user daily cap.
 
 Ollama with Llama 3.1 was tried first and abandoned as too slow and too weak for the
@@ -452,8 +518,11 @@ ai_moodle/
     │   ├── chat.php             Assistant endpoint
     │   ├── lib.php              Course nav and the chat widget
     │   ├── locallib.php         Shared helpers and the tab row
+    │   ├── db/hooks.php         Puts the chat widget on course pages
     │   └── classes/
     │       ├── chat.php         Assistant: context building, access control
+    │       ├── course_agent.php Teacher assistant's tools: propose, try out, apply
+    │       ├── hook_callbacks.php  The widget's footer hook
     │       ├── reading.php      State of a book's background reading
     │       ├── task/read_book.php  The background task that reads the book
     │       ├── slide_deck.php   Render and parse deck PDFs
@@ -480,6 +549,7 @@ Roughly 5,000 lines of original PHP across the two plugins.
 | `revise_slides()` | Applies a revision request as edits |
 | `generate_questions()` | Multiple-choice questions from a deck |
 | `ask_model()` | Provider-agnostic call with rate-limit spacing |
+| `chat_with_tools()` | One turn of a conversation with function calling |
 
 ---
 
@@ -516,12 +586,18 @@ failure stops the work with Docling's reason rather than falling back to a worse
   closest available and is good, but not perfect on a scanned page.
 - **Small text inside raster maps is not recovered.** Docling caps `images_scale` at 2
   server-side, and labels printed into low-resolution map images stay unreadable.
-- **The assistant has no memory.** Each question is answered independently, so follow-ups
-  like "tell me more about question 2" do not resolve.
+- **The student assistant has no memory.** Each question is answered independently, so
+  follow-ups like "tell me more about question 2" do not resolve. A teacher's assistant
+  remembers the last three exchanges and what became of its proposals, for the session.
 - **Teacher question lists are shuffled per request**, so numbering is not stable between
   answers.
 - **"Is it covered by the lectures" is a keyword test**, so the assistant sometimes opens
-  the book when it did not need to. Costs time, never correctness.
+  the book when it did not need to. Costs time, never correctness. A question written
+  entirely in English about a Macedonian course never opens it, having no words that could
+  be looked up there.
+- **Wide tables are cramped in the widget.** A lesson plan's table is readable but narrow;
+  saved as a page it shows at full width.
+- **The plugin needs Moodle 4.5** (4.4 at the least), for the hook the widget uses.
 - **Exams assume up to 12 lectures**, split 1–6 and 7–12.
 - **Revising a deck leaves its PowerPoint and lab quiz stale.** You are warned, and must
   delete and rebuild them if you want them to follow.
