@@ -275,27 +275,14 @@ if ($go && confirm_sesskey()) {
             'notifymessage');
         flush();
 
-        $slides = array();
-        $missed = 0;
-        foreach ($presentation['chunks'] as $chunk) {
-            try {
-                $text = \mod_book\ai_service::extract_pages($bookpath,
-                    $chunk['from'] + $outline['offset'], $chunk['to'] + $outline['offset']);
-                $slides[] = array(
-                    'heading' => $presentation['title'],
-                    'bullets' => $chunk['titles'],
-                );
-                $slides = array_merge($slides,
-                    \mod_book\ai_service::generate_slides($presentation['title'], $text));
-            } catch (Exception $e) {
-                $missed++;
+        list($slides, $missed) = local_course_structure_write_slides($bookpath, $outline['offset'],
+            $presentation, function($error) use ($OUTPUT, $presentation) {
                 echo $OUTPUT->notification(
                     get_string('lecturefailed', 'local_course_structure', (object)array(
-                        'title' => s($presentation['title']), 'error' => s($e->getMessage()))),
+                        'title' => s($presentation['title']), 'error' => s($error))),
                     'notifyerror');
                 flush();
-            }
-        }
+            });
 
         if (empty($slides)) {
             continue;
@@ -339,53 +326,9 @@ if ($go && confirm_sesskey()) {
 
             // The deck is labelled with the topic it is filed under, which for a
             // presentation drawing on several chapters says more than the first.
-            $pdfpath = $workdir . '/deck-' . uniqid() . '.pdf';
-            \local_course_structure\slide_deck::render($presentation['title'],
-                $coursetopics[$topic] ?? $presentation['chapter'], $slides, $pdfpath);
-
-            $draftid = file_get_unused_draft_itemid();
-            $fs->create_file_from_pathname(array(
-                'contextid' => context_user::instance($USER->id)->id,
-                'component' => 'user',
-                'filearea'  => 'draft',
-                'itemid'    => $draftid,
-                'filepath'  => '/',
-                'filename'  => clean_param($presentation['title'], PARAM_FILE) . '.pdf',
-            ), $pdfpath);
-            unlink($pdfpath);
-
-            $module = $DB->get_record('modules', array('name' => 'resource'), '*', MUST_EXIST);
-
-            $data = new stdClass();
-            $data->course = $course->id;
-            $data->modulename = 'resource';
-            $data->module = $module->id;
-            $data->section = $topic;
-            $data->name = $presentation['title'];
-            $data->intro = $intro;
-            $data->introformat = FORMAT_HTML;
-            $data->visible = 1;
-            $data->files = $draftid;
-            $data->display = RESOURCELIB_DISPLAY_AUTO;
-            // The reading is only worth showing on the course page if there is any.
-            $data->printintro = ($intro === '') ? 0 : 1;
-            $data->showsize = 1;
-            $data->showtype = 0;
-            $data->showdate = 0;
-            $data->popupwidth = 620;
-            $data->popupheight = 450;
-            $data->filterfiles = 0;
-            $data->cmidnumber = 'csgen-' . $index . ($missed > 0 ? '-part' : '');
-            $data->groupmode = 0;
-            $data->groupingid = 0;
-            $data->completion = 0;
-            $data->completionview = 0;
-            $data->completionexpected = 0;
-            $data->availabilityconditionsjson = '';
-
-            ob_start();
-            add_moduleinfo($data, $course);
-            ob_end_clean();
+            local_course_structure_add_deck($course, $topic, $presentation['title'],
+                $coursetopics[$topic] ?? $presentation['chapter'], $slides,
+                'csgen-' . $index . ($missed > 0 ? '-part' : ''), $intro);
             $made++;
 
         } catch (Exception $e) {
@@ -475,18 +418,28 @@ if ($count > 0) {
         echo '</div>';
 
         // Every section of the book is on offer, a chapter to a fold. A fold holding
-        // a ticked section starts open, so the suggested split is in view.
-        foreach ($chapters as $chapter) {
+        // a ticked section starts open, so the suggested split is in view. The box on
+        // a fold ticks the whole chapter; clicking its name only opens the fold, since
+        // a box inside a summary does not toggle it.
+        echo '<div class="lcs-ticks">';
+        echo '<div class="form-check mb-2 pb-2 border-bottom">';
+        echo '<input type="checkbox" class="form-check-input lcs-all" id="all_' . $i . '">';
+        echo '<label class="form-check-label font-weight-bold" for="all_' . $i . '">' .
+             get_string('joinselectall', 'local_course_structure') . '</label></div>';
+        foreach ($chapters as $chapterindex => $chapter) {
             $open = (bool)array_intersect($chapter['keys'], $keys);
             echo '<details class="mb-2"' . ($open ? ' open' : '') . '>';
-            echo '<summary>' . s($chapter['name']) . '</summary>';
-            echo '<div class="pl-3 pt-1">';
+            echo '<summary><input type="checkbox" class="lcs-chapter mr-2" data-chapter="' .
+                 $chapterindex . '" aria-label="' .
+                 s(get_string('selectchapter', 'local_course_structure', $chapter['name'])) . '">' .
+                 s($chapter['name']) . '</summary>';
+            echo '<div class="pl-4 pt-1">';
             foreach ($chapter['keys'] as $key) {
                 $section = $sections[$key];
                 $boxid = 'sec_' . $i . '_' . $key;
                 echo '<div class="form-check">';
-                echo '<input type="checkbox" class="form-check-input" id="' . $boxid .
-                     '" name="sec_' . $i . '[]" value="' . $key . '"' .
+                echo '<input type="checkbox" class="form-check-input lcs-section" id="' . $boxid .
+                     '" name="sec_' . $i . '[]" value="' . $key . '" data-chapter="' . $chapterindex . '"' .
                      (isset($ticked[$key]) ? ' checked' : '') . '>';
                 echo '<label class="form-check-label" for="' . $boxid . '">' .
                      s($section['title']) . ' <span class="text-muted">(' .
@@ -496,9 +449,11 @@ if ($count > 0) {
             }
             echo '</div></details>';
         }
+        echo '</div>';
 
         echo '</fieldset>';
     }
+    echo local_course_structure_tick_script();
 
     echo '<div class="form-check mb-3">';
     echo '<input type="checkbox" class="form-check-input" id="sources" ' .

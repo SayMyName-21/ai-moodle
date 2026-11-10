@@ -1014,13 +1014,56 @@ class ai_service {
         return (float)($item['prov'][0]['bbox']['t'] ?? 0);
     }
 
+    /** Bumped whenever a change to reading the outline should replace saved ones. */
+    const OUTLINE_VERSION = 1;
+
     /**
-     * Read the book's structure along with the page range each entry covers.
+     * The book's structure along with the page range each entry covers.
+     *
+     * Worked out once per book and saved; the Presentations tab asks for it on
+     * every visit. Working it out again is mostly quick, but a book that names
+     * its chapters neither by label nor by number has the model asked which they
+     * are, which costs allowance and need not come out the same twice - the
+     * sections offered would shift between visits.
+     *
+     * The saved outline lives with Moodle's data rather than in its temp folder,
+     * whose files a site's cleanup task deletes after a week.
      *
      * @param string $filepath Path to the PDF
      * @return array offset, total pages, and chapters each holding their subtopics
      */
     public static function get_outline($filepath) {
+        $saved = make_upload_directory('mod_book/outlines') . '/' . sha1_file($filepath) . '.json';
+
+        if (file_exists($saved)) {
+            $kept = json_decode(file_get_contents($saved), true);
+            if (is_array($kept) && ($kept['version'] ?? 0) === self::OUTLINE_VERSION
+                    && isset($kept['outline']['chapters'])) {
+                return $kept['outline'];
+            }
+        }
+
+        $settled = true;
+        $outline = self::read_outline($filepath, $settled);
+
+        // An outline the model could not help with is not kept, so the next visit
+        // asks again rather than living with the fallback for the whole semester.
+        if ($settled) {
+            file_put_contents($saved, json_encode(array('version' => self::OUTLINE_VERSION,
+                'outline' => $outline), JSON_UNESCAPED_UNICODE));
+        }
+
+        return $outline;
+    }
+
+    /**
+     * Work out the book's structure and page ranges.
+     *
+     * @param string $filepath Path to the PDF
+     * @param bool $settled Set to false if the model was needed and gave no answer
+     * @return array offset, total pages, and chapters each holding their subtopics
+     */
+    private static function read_outline($filepath, &$settled) {
         $contents = self::book_contents($filepath);
         $toc = $contents['toc'];
         $structure = self::detect_main_chapters($toc);
@@ -1037,6 +1080,8 @@ class ai_service {
             $bymodel = self::chapters_by_model($toc, $structure);
             if (count($bymodel) >= 2) {
                 $structure = array('titles' => $bymodel, 'tier' => 3);
+            } else {
+                $settled = false;
             }
         }
 
@@ -1363,7 +1408,21 @@ class ai_service {
             $lastcall = time();
         }
 
-        $result = self::model_request($url, $payload, $headers);
+        // The model thinks before it answers, out of the same budget, and how long
+        // it thinks varies: the same kind of request was seen to spend 115 tokens
+        // thinking once and 866 the next, which left no room for the answer and cut
+        // its JSON off part way. That one is tried once more with room to spare.
+        try {
+            $result = self::model_request($url, $payload, $headers);
+        } catch (\Exception $e) {
+            if ($provider === 'ollama' || strpos($e->getMessage(), 'json_validate_failed') === false) {
+                throw $e;
+            }
+            $payload['max_tokens'] = min(2 * $maxtokens, 5000);
+            sleep(self::REQUEST_SPACING);
+            $lastcall = time();
+            $result = self::model_request($url, $payload, $headers);
+        }
         $text = ($provider === 'ollama')
             ? ($result['response'] ?? '')
             : ($result['choices'][0]['message']['content'] ?? '');
@@ -1550,9 +1609,10 @@ class ai_service {
             "PRESENTATION TITLE: $title\n\n" .
             "EXTRACT:\n" . mb_substr($text, 0, self::EXTRACT_CHARS, 'UTF-8');
 
-        // There is a daily token budget as well as a per-minute one, and a full run of
-        // 24 requests has to fit inside it, so the reply is kept tight.
-        $reply = self::ask_model($prompt, 1600);
+        // The budget covers the model's thinking as well as the slides, and 1600 was
+        // seen to run out on thinking alone. Only what is used counts against the
+        // daily allowance; with the longest extract this still fits the per-minute one.
+        $reply = self::ask_model($prompt, 3000);
 
         return self::clean_slides($reply, $title);
     }
@@ -1601,6 +1661,73 @@ class ai_service {
         $reply = self::ask_model($prompt, 1800);
 
         return self::apply_edits($slides, $reply['edits'] ?? array(), $title);
+    }
+
+    /**
+     * Make one lecture out of slides written part by part for a joined presentation.
+     *
+     * Each part was written from its own pages of the book, so read straight
+     * through they would repeat each other's introductions and stop dead where one
+     * part gives way to the next. The model sees the whole deck in brief and
+     * returns edits, as revise_slides does: an overview at the front, a summary at
+     * the end, repeats taken out and links added where the parts meet.
+     *
+     * The divider slides opening each part are left alone. They name the lessons
+     * each part came from, which is how the deck is traced back to the book if it
+     * is joined again.
+     *
+     * @param string $title The joined presentation's title
+     * @param array $slides Its slides, part after part
+     * @param array $dividers Positions in $slides of the divider slides
+     * @return array The slides made into one lecture
+     * @throws \Exception if the model cannot be reached or suggests nothing
+     */
+    public static function join_slides($title, $slides, $dividers) {
+        $dividers = array_flip($dividers);
+
+        // In brief, so that a deck several parts long still fits one request: the
+        // model needs to see what each slide is about, not every word of it.
+        $current = '';
+        foreach ($slides as $position => $slide) {
+            $current .= ($position + 1) . '. ' . (isset($dividers[$position]) ? '[PART DIVIDER] ' : '') .
+                $slide['heading'] . "\n";
+            foreach (array_slice($slide['bullets'], 0, 4) as $bullet) {
+                $current .= '   - ' . mb_substr($bullet, 0, 70, 'UTF-8') . "\n";
+            }
+        }
+
+        $prompt = "These slides were written in separate parts, each from its own pages of a " .
+            "textbook, and are now being joined into ONE lecture presentation. Make them read " .
+            "as a single lecture.\n\n" .
+            "- Put one overview slide at the very front, saying what the lecture covers and in " .
+            "what order.\n" .
+            "- Put one summary slide at the very end, drawing the parts together.\n" .
+            "- Delete a slide that repeats one earlier in the deck, such as a second general " .
+            "introduction.\n" .
+            "- Where one part gives way to the next, a slide may be replaced so that it leads " .
+            "on to what follows.\n" .
+            "- Never edit or delete a slide marked [PART DIVIDER].\n" .
+            "- Keep everything else as it is. Write in the language the slides are in, and add " .
+            "no facts that are not already in the slides.\n\n" .
+            "Do not return the whole presentation. Return only the changes, as a list of edits. " .
+            "Each edit is one of:\n" .
+            "  {\"action\":\"replace\",\"slide\":N,\"heading\":\"...\",\"bullets\":[\"...\"]}\n" .
+            "  {\"action\":\"insert_after\",\"slide\":N,\"heading\":\"...\",\"bullets\":[\"...\"]}\n" .
+            "  {\"action\":\"delete\",\"slide\":N}\n\n" .
+            "N is the slide's number as given below; use 0 with insert_after for the front. " .
+            "Return JSON:\n{\"edits\":[ ... ]}\n\n" .
+            "PRESENTATION TITLE: $title\n\n" .
+            "THE SLIDES, IN BRIEF:\n" . mb_substr($current, 0, self::EXTRACT_CHARS, 'UTF-8');
+
+        $reply = self::ask_model($prompt, 1800);
+
+        $edits = array_filter($reply['edits'] ?? array(), function($edit) use ($dividers) {
+            $number = (int)($edit['slide'] ?? 0);
+            $action = $edit['action'] ?? '';
+            return $action === 'insert_after' || !isset($dividers[$number - 1]);
+        });
+
+        return self::apply_edits($slides, $edits, $title);
     }
 
     /**

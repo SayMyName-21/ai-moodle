@@ -51,15 +51,19 @@ Sub-topics can optionally be listed under each section, indented as the book has
 A two-step wizard. You choose **how many** presentations you want, then **which parts of the
 book** go into each one, with an editable title per presentation.
 
-- Parts are seeded evenly in book order, and you can move them freely.
-- **A presentation cannot span two chapters.** Each one is filed under a single course
-  topic, so mixing chapters would make its placement arbitrary. The form only offers one
-  chapter's parts per presentation, and the server rejects a hand-made request that mixes
-  them anyway.
-- Because of that, the minimum number of presentations is the number of chapters the book
-  has — otherwise a chapter would go unrepresented.
+- Parts are seeded evenly in book order, and you can move them freely — any part into any
+  presentation, across chapters.
+- Each presentation gets a course topic of your choosing; there is no minimum count.
 
 Each presentation becomes a PDF slide deck attached to its topic.
+
+**Joining presentations.** The Join tab makes one presentation out of two or more. It does not
+put the old slides end to end: each deck's divider slides name the book lessons it was built
+from, so the deck is traced back to its sections of the book (shown for the teacher to check
+and adjust), the new deck is written afresh from those pages, and one more request makes it a
+single lecture — an overview at the front, links where the parts meet, a summary at the end,
+repeats removed. The divider slides are left alone, so a joined deck can be joined again. The
+originals can be hidden (not deleted). Revisions made to the originals are not carried over.
 
 ### 3. PowerPoint conversion
 
@@ -386,6 +390,9 @@ The free tier shapes much of the design: **8,000 tokens per minute** covering pr
 reply together, and **200,000 per day**. Consequences visible throughout the code:
 
 - Requests are spaced **50 seconds** apart (`REQUEST_SPACING`).
+- `gpt-oss` thinks before answering, out of the same token budget, and how long varies — 115
+  tokens one time, 866 the next. Slide writing gets 3,000 tokens, and a reply cut off part
+  way (`json_validate_failed`) is retried once with twice the room.
 - Book extracts are capped at **7,000 characters** (`EXTRACT_CHARS`) — Cyrillic costs
   roughly one token per two characters, so a larger extract is rejected outright.
 - A run that stops part way through is resumable: anything already built is kept and only
@@ -515,6 +522,7 @@ ai_moodle/
     │   ├── powerpoint.php       PPTX conversion
     │   ├── quizzes.php          Lab quizzes and exams
     │   ├── revise.php           Presentation revision
+    │   ├── join.php             Join presentations into one, rewritten from the book
     │   ├── chat.php             Assistant endpoint
     │   ├── lib.php              Course nav and the chat widget
     │   ├── locallib.php         Shared helpers and the tab row
@@ -565,6 +573,13 @@ and anything it names that is not in the contents verbatim is thrown away.
 back out of the deck PDF rather than from a database. One source of truth, and editing a
 deck's text is reflected everywhere downstream.
 
+**The outline is worked out once per book.** `get_outline()` — the chapters, their
+sub-topics and the pages each covers — is saved per book under `moodledata/mod_book/outlines`
+and served from there on every visit to the Presentations tab, so a book whose chapters only
+the model could pick out is not asked about again, and the sections offered cannot shift
+between visits. A change to how outlines are read bumps `OUTLINE_VERSION`, which replaces
+the saved ones. An outline the model could not help with is not saved.
+
 **Generated activities are marked, not tracked.** Everything the plugin creates carries an
 `idnumber` — `csgen-N`, `csgenppt-N`, `csgenlab-N`, `csgenexam-N` — so a rerun can tell what
 it already built without a separate table. A partially built deck is marked `-part` so it is
@@ -598,6 +613,10 @@ failure stops the work with Docling's reason rather than falling back to a worse
 - **Wide tables are cramped in the widget.** A lesson plan's table is readable but narrow;
   saved as a page it shows at full width.
 - **The plugin needs Moodle 4.5** (4.4 at the least), for the hook the widget uses.
+- **The book's reading is kept in Moodle's temp folder** (`temp/mod_book/bookpages`). This
+  stack's cron runs ad hoc tasks only, but on a site that also runs scheduled tasks,
+  `file_temp_cleanup_task` deletes temp files untouched for a week, and the book would be
+  read again from the start.
 - **Exams assume up to 12 lectures**, split 1–6 and 7–12.
 - **Revising a deck leaves its PowerPoint and lab quiz stale.** You are warned, and must
   delete and rebuild them if you want them to follow.
