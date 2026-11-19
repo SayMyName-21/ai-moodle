@@ -87,6 +87,20 @@ if ($ADMIN->fulltree) {
         PARAM_TEXT,
         30));
 
+    $settings->add(new admin_setting_configtext('book/groq_vision_model',
+        get_string('groqvisionmodel', 'mod_book'),
+        get_string('groqvisionmodel_desc', 'mod_book'),
+        'qwen/qwen3.8-27b',
+        PARAM_TEXT,
+        50));
+
+    $settings->add(new admin_setting_configtext('book/ollama_vision_model',
+        get_string('ollamavisionmodel', 'mod_book'),
+        get_string('ollamavisionmodel_desc', 'mod_book'),
+        'llava',
+        PARAM_TEXT,
+        30));
+
     $settings->add(new admin_setting_configtext('book/ai_api_key',
         get_string('aiapikey', 'mod_book'),
         get_string('aiapikey_desc', 'mod_book'),

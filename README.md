@@ -3,7 +3,7 @@
 Turns a textbook PDF into a working Moodle course. Upload a book and the plugin reads its
 table of contents, builds the course topics from it, writes lecture slide decks from the
 book's own pages, converts them to editable PowerPoint, writes quizzes and exams from the
-lectures, finds English further reading, and adds a chat assistant that answers questions
+lectures, finds further reading, web links and videos for the teacher to review, and adds a chat assistant that answers questions
 about the course — one answer for teachers, a different and deliberately narrower one for
 students.
 
@@ -73,15 +73,32 @@ subject to any rate limit.
 
 ### 4. Quizzes and exams
 
-- **Lab quizzes** — one per lecture, 5 multiple-choice questions, placed in the same topic
-  as its presentation.
-- **Exams** — two, in the course's general section, the first covering lectures 1–6 and the
-  second 7–12. Their questions are written fresh rather than reused from the lab quizzes,
-  and each exam draws half its pool at random per attempt, so no two sittings are identical.
+The teacher picks what to build, one quiz at a time:
 
-Questions are written from the slide decks, not from the book, so they test what was
-actually taught. Within every quiz the questions are shuffled, and so are the options
-inside each question.
+- **Kind.** A **practice quiz** puts every question on every attempt, checks each answer as it
+  is given (Moodle's *immediate feedback*), and allows unlimited attempts. An **exam** is a pool
+  from which each attempt draws its own paper, marked at the end, with a time limit and number
+  of attempts the teacher sets.
+- **Presentations.** Any of them, one or all; there is no fixed split. The questions are shared
+  out evenly over the ones ticked.
+- **How many**, and for an exam how many per attempt (half the pool by default).
+- **Question types**, any of thirteen: multiple choice (one or several right), true/false,
+  matching, ordering, short answer, numerical, essay (with a marking guide for the teacher),
+  random short-answer matching, drag and drop into text, select missing words, embedded answers
+  (cloze), calculated multichoice and calculated simple. Each question is given its type in
+  advance, the types taking turns, so the quiz gets the mix chosen. Where the material has
+  nothing a type needs — numbers for a calculation, a sequence to order — the model writes
+  multiple choice instead.
+- **Instructions** for the model (*"harder"*, *"focus on definitions"*), a name and a topic.
+
+Questions are written from the presentation's slides **and the book pages it was built from**
+(traced the same way the Join tab traces them), unless the teacher unticks the book. Each
+request takes five questions, the slides' outline and a different stretch of those pages, so a
+long chapter is asked about throughout. Every question carries feedback saying why the right
+answer is right. Within every quiz the questions are shuffled, and so are the options inside
+each question. Quizzes already in the course are never touched; a new one gets a new name and
+marker (`csgenexam-N`, `csgenquiz-N`, or `csgenlab-<deck>` for a practice quiz on one
+presentation).
 
 ### 5. Revision
 
@@ -104,7 +121,7 @@ reply stays small no matter how long the deck is (returning a 13-slide Cyrillic 
 overflowed the token budget outright), and slides you did not ask about are untouched *by
 construction* rather than by the model's good behaviour.
 
-### 6. English further reading
+### 6. Further reading and web links
 
 Optional during generation. Each topic is searched on the **Macedonian** Wikipedia and
 followed to its English counterpart through the API's language links. The links appear as a
@@ -124,16 +141,87 @@ On the test textbook this yields 23 links across 10 of 12 sections. The two that
 nothing are abstract compound headings with no matching article — left empty on purpose,
 because no links beats wrong links.
 
-### 7. Course assistant
+The **Videos and reading** tab adds the same reading to presentations already built, one at a
+time or all at once.
+
+**Links from the rest of the web** are added one at a time, each reviewed by the teacher
+first, on the same tab or by asking the assistant (*find_link*):
+
+- **Found by search.** The AI writes three searches (the slides' language and English; all
+  in one language if the teacher asks for it), SearXNG runs them, and the AI ranks the real
+  results by how closely they match the presentation. Results are taken from each search in
+  turn, so the first search cannot crowd out the rest. Two small AI requests per link. The
+  searches never say "lecture", "presentation" or "slides": with those words they found
+  other people's slide decks. Shops, social media, YouTube (videos have their own feature)
+  and slide-sharing sites are left out.
+- **Or pasted by the teacher**, from anywhere. Cyrillic addresses are encoded as a browser
+  would.
+- **Opened before it is offered**, with Moodle's own protection against internal addresses
+  left on, so a link to the stack's other containers, the database or `localhost` is
+  refused. A page that does not load, or whose title is not the one the search reported, is
+  passed over for the next in the ranking. A site that turns away automated visits (401,
+  403, 429) is offered with a note that it could not be checked.
+- **The teacher decides.** The card shows the page, its address, the AI's reason and its
+  language; the teacher accepts it, declines it (never offered again), or says what to look
+  for instead (*"in English"*, *"for younger students"*). Accepted links go under the
+  presentation as *More to read and explore*, between the Wikipedia reading and the videos,
+  and open in a new tab. Kept per course as `links_<courseid>` in the plugin's config.
+
+### 7. Videos
+
+On the **Videos and reading** tab, each presentation can be given YouTube videos. The AI
+looks for one on what the presentation covers and shows it to the teacher, playable on the
+page with the AI's reason for choosing it. The teacher **accepts** it, **declines** it (it is
+never offered again), or types what to look for instead — *"in English"*, *"under ten
+minutes"*, *"an animation"* — and asks for another. Instructions add up until a video is
+accepted, so *"shorter"* after *"in English"* means both. An accepted video goes under the
+presentation on the course page **as a link** that opens YouTube in a new tab, unless the
+teacher picks **Accept as an embedded player**. Either can be switched later on the tab (*Show
+as a link* / *Embed as a player*) or by asking the assistant (*propose_video_display*). Asked
+for a video "as a player", the assistant puts that button first on the card. A player is a
+plain link that Moodle's multimedia filter turns into one; a link carries the
+`nomediaplugin` class so the filter leaves it alone. Videos accepted before this choice
+existed stay players.
+
+No video is offered that YouTube has not confirmed:
+
+- **With a YouTube Data API key** (Site administration → Plugins → Local plugins → Course
+  Structure Generator), the model writes three searches — in the slides' language, a related
+  language with more videos (Serbian or Russian for Macedonian) and English, or all in the
+  language the teacher asks for — YouTube's own search runs them, and the model picks one of
+  the real results. Two small AI requests and about 300 of YouTube's 10,000 free daily units
+  per video. The searches are kept to what a viewer would type: with "lecture" in them they
+  found recorded talks, and the picker, told to refuse anything unsuitable, turned down a
+  list holding a fitting 8th-grade lesson; it is now told a good video on the subject is
+  enough.
+- **Without a key**, the model searches the web itself (Groq's search for its gpt-oss
+  models) and names candidates. Each is looked up on YouTube's oEmbed endpoint, which
+  answers only for a video that exists and may be embedded, and the title YouTube gives must
+  resemble the one the model claimed, so a made-up or mistyped id is dropped. This costs far
+  more of the daily AI allowance — the search results count as input — and is the reason the
+  key is worth setting.
+
+### 8. Course assistant
 
 A chat widget in the bottom-right corner of course pages, described in its own section
 below. For teachers it can also change the course, showing every change for approval first,
 and write material for the teacher — a lesson plan for a lecture, say — that it can then save
-into the course as a page hidden from students.
+into the course as a page hidden from students. It can also do **everything on the
+generator's tabs**: build, join and revise presentations, convert them to PowerPoint, write
+quizzes and exams, add reading and videos, and read the book and create the topics.
+
+Anyone can **show the assistant a picture**, with the paperclip button or by pasting a
+screenshot into the question box: a diagram, a photographed worksheet, a chart. A student can
+ask about it; a teacher can also have it put into the course, or use what it shows, for
+example to write quiz questions about a diagram.
+
+A teacher can turn on **hard learning** for their course, with the *Hard learning* tick box
+in the assistant's header. The students' assistant then becomes a tutor that guides them
+toward answers and never states one. See [Hard learning](#hard-learning).
 
 ---
 
-## The five screens
+## The seven screens
 
 All reachable from a tab row, inside any course:
 
@@ -142,8 +230,13 @@ All reachable from a tab row, inside any course:
 | Course structure | `index.php` | Upload the book, build the topics |
 | Presentations | `lectures.php` | Count → assignment wizard → generation |
 | PowerPoint | `powerpoint.php` | Convert decks to `.pptx` |
-| Quizzes and exams | `quizzes.php` | Lab quizzes and the two exams |
+| Quizzes and exams | `quizzes.php` | A practice quiz or an exam from chosen presentations |
 | Revise | `revise.php` | Rewrite a presentation from a request |
+| Join | `join.php` | Join presentations into one, rewritten from the book |
+| Videos and reading | `extras.php` | Wikipedia reading and YouTube videos under each presentation |
+
+The work behind every tab lives in `locallib.php` as functions that report their progress
+through a callback, so the tabs and the assistant's background jobs run the same code.
 
 ---
 
@@ -242,9 +335,28 @@ rebuilds from the deck PDF, it costs no AI allowance.
 
 ### Quiz building
 
-Questions go into Moodle through its **GIFT import format**, which handles the awkward part:
-in Moodle 4 a question spans `question`, `question_bank_entries` and `question_versions`,
-and letting the importer deal with that is far safer than writing those rows directly.
+Questions go into Moodle through its **Moodle XML import format**, which handles the awkward
+part: in Moodle 4 a question spans `question`, `question_bank_entries` and `question_versions`,
+and letting the importer deal with that is far safer than writing those rows directly. GIFT,
+used before, covers only the simplest types; XML covers all thirteen.
+
+The model returns each question as JSON in a shape per type (`QUESTION_FORMATS` in
+`ai_service.php`). `quiz_builder::clean_question()` checks it before anything is written:
+four distinct options with a valid answer key, gaps `[[1]]`…`[[n]]` each used once, at least
+three pairs to match. Calculated questions are worked through ten random data sets with
+Moodle's own formula evaluator, and dropped if any comes out undefined or if two options of
+a calculated multichoice give the same number. Gaps written as a list ("[[1]], [[2]] and
+[[3]]") whose words could be swapped would mark a right answer in another order wrong, so all
+but the first are written into the sentence and the gaps left renumbered
+(`quiz_builder::untangle_lists()`); a cloze list is repaired only when its gaps are typed words
+or drop-downs offering each other's answers, and numbers ("from [[1]] to [[2]]") are left
+alone. A `*` is taken out of short answers, as Moodle reads it as a wildcard. A cloze question's gaps are written into
+Moodle's embedded-answer syntax here, with its special characters escaped. Random short-answer
+matching draws on short questions about key terms, kept in a category of their own under the
+quiz's so that it draws on those alone; in an exam it sits on every paper, beside the random
+draw. Two importer quirks are worked around: an ordering question without `<shownumcorrect>`
+gets two empty hints the database rejects, and a cloze question's parts come back from the
+import as questions of their own, which are left out of the quiz.
 
 ---
 
@@ -306,6 +418,49 @@ group rules are respected without reimplementing them.
 - **A per-person daily cap** (default 40 questions) stops one user spending the whole daily
   AI allowance that lecture generation also depends on.
 
+### Hard learning
+
+Off by default, and set one course at a time by anyone who can edit that course
+(`moodle/course:update`), with the tick box in the assistant's header. It is stored as
+`hardlearning_<courseid>` in the plugin's config; `chat.php` checks the capability again
+when it is changed, so a student cannot turn it off by posting the request by hand.
+Teachers' own assistant is unchanged.
+
+It is a port of the teacher's *Hard Learn* browser extension, which wraps
+every message a student sends to ChatGPT or Gemini in tutoring rules. Here the rules are the
+assistant's own instructions, written on the server (`classes/tutor.php`), so there is no
+wrapper for the student to delete and no extension to switch off. What was carried over:
+
+- **Never the answer.** The tutor gives feedback, questions and next steps, and holds to
+  that when the student insists, claims the teacher allows it, or says they only want to
+  check. It still has the course material, so it knows what is right and can point the
+  student at the lecture that covers it.
+- **Two levels of help**, from the extension's four: *Coach* (feedback on the student's
+  reasoning and guiding questions only) and *Hint* (the single next step). Its *Explain*
+  and *Answer* levels give the solution, so they have no place here. Students start on Hint.
+- **Think first.** A new question that comes without the student's own attempt or guess
+  gets asked for one before any hint.
+- **The 85% rule.** Each reply judges the student's latest attempt (correct, partly right,
+  not right yet), and the student sees that judgement. Over the last ten judged attempts,
+  above 90% moves the student to Coach and below 75% back to Hint, at most once every four
+  attempts. The level and record are kept per student per course, in a user preference.
+- **Leak check.** Told not to, the model still slipped parts of the answer into its hints
+  ("look where the atmosphere, hydrosphere and lithosphere are mentioned"). So with each reply
+  it also lists, privately, the key terms that make up the full answer, and these add up
+  over the conversation. A reply that uses one the student has not written themselves
+  (compared by word stem, so "атмосфера" catches "атмосферата"), or that looks like the answer
+  in other ways ("the answer is", "точниот одговор е", a boxed result, a long code block, too
+  long for a hint), is rewritten once as a hint before the student sees it. Any key term still
+  in the rewrite is blanked out as `___`. The extension instead shows such replies blurred.
+- **Reply language.** The tutor kept answering an English question in Macedonian after a
+  Macedonian conversation, so the server tells it which alphabet the latest message is in.
+- **Memory of the conversation.** The tutor is reminded of the last six exchanges, kept in
+  the session, since guiding someone takes several turns. (The ordinary student assistant
+  answers each question on its own.)
+
+Left out: the extension's site adapters and browser UI, which Moodle does not need, and the
+telemetry from its research-study plan.
+
 ### Changing the course (teachers)
 
 A teacher can ask the assistant to change the course — *"hide the atmosphere quiz and let
@@ -347,9 +502,54 @@ How it reaches Moodle (`classes/course_agent.php`), via the model's function cal
 | Rename a topic or change its description | `course_update_section` |
 | Questions into a quiz | GIFT import via `quiz_builder` |
 
+| `generator_info` | The generator's presentations (with cmids, PowerPoint, quiz, reading, videos), the book's parts by key, the book's reading, a deck's slides, background jobs |
+| `propose_generator_task` | The tabs' own functions in `locallib.php`, run as a background job |
+| `find_video` | `classes/videos.php`, the same search as the Videos and reading tab |
+
 Web-service functions alone could not create activities, change a quiz's settings, write
 questions or rename a topic in Moodle 4.5, which is why those have tools of their own and
 why this is built into the assistant rather than run through an MCP server.
+
+**The generator's tabs, from the assistant.** *"Build a presentation on sections 3 and 4 in
+topic 2 with Wikipedia links"*, *"join the biosphere and energy presentations"*, *"make lab
+quizzes for the new ones"*, *"read the book again using the ТЕМА headings"*. Each is checked
+as it is proposed — book section keys and presentation ids must exist, a presentation that
+already has a quiz is not given another — and the proposal shows what will actually be done:
+the book's parts by name, the request count and time it will take. Most of this takes
+minutes to an hour on the free AI plan, longer than a request can wait, so on Apply it is
+queued as a **job**: an ad hoc task the cron worker runs **as the teacher who approved it**
+(`classes/job.php`, `classes/task/run_job.php`), through the same functions as the tabs. The
+widget shows each job and checks on it every 15 seconds until it finishes, and the teacher can
+ask the assistant how it is going. Presentations the assistant builds are added after those
+already in the course rather than at the positions a tab run would use, which those already
+built would block.
+
+A book can be given to the assistant with the paperclip button and made the course book on
+request (*use_attached_book*), which starts the same background reading as an upload on the
+Course structure tab. Asked for a video, the assistant searches and shows the video in the
+chat with Accept, Decline and Find another, exactly as on the tab; it never proposes one
+itself.
+
+**Pictures.** The paperclip also takes a picture (PNG, JPEG, GIF or WebP, up to 10 MB), and a
+screenshot pasted into the question box is attached the same way. This works for students as
+well as teachers. The models that answer read only text, so each picture is described once,
+as it arrives, by a vision model (`describe_image()`, Groq's `qwen/qwen3.8-27b` by default):
+what it is, every piece of text and formula in it copied exactly, and diagrams in enough detail
+to write questions about. That description goes to the assistant under *PICTURES ATTACHED*,
+marked as material and never instructions, and takes its room from the course material. The
+last three pictures of a conversation are kept (in the course's `chatimage` file area, per
+user); older ones and those from ended sessions are deleted when a new one arrives. Describing
+a picture counts as one question against the daily cap.
+
+A teacher's assistant can put a picture into the course with *propose_image*: as a new label
+in a topic, at the end of an existing page or label, or at the end of a topic's description,
+with alt text and an optional caption. Like any change it is tried out and waits for Apply.
+The picture is copied into the files of the label, page or topic that shows it, as one added
+in the editor would be, so it stays after the conversation's copy is gone.
+
+The generator's rules and tools add some 3,000 characters to every first request, so the
+course material sent alongside is cut by as much, keeping the first turn inside the free
+tier's 8,000 tokens a minute.
 
 A request that changes things takes several turns with the model, and on the free tier that
 means 30 seconds to a few minutes — about two and a half for two changes in one request. The model reads Macedonian imperfectly: it has twice applied a setting
@@ -376,6 +576,7 @@ content of each change visible, is what catches that, and it will also show inve
 | Tool | Role |
 |---|---|
 | **Docling** (`quay.io/docling-project/docling-serve`) | The only PDF reader: layout-aware reading, OCR and page counts, port 5001 |
+| **SearXNG** (`searxng/searxng:2026.10.30-ffa88e3ba`) | Web search for the links under presentations; internal network only, no host port. Settings in `searxng/settings.yml` |
 | **Tesseract 4.1** + `mkd.traineddata` | The only Macedonian-capable OCR engine available |
 | **TCPDF** (via Moodle `pdflib.php`) | Rendering slide decks, `freesans` for Cyrillic |
 | **ZipArchive** + OOXML | Writing `.pptx` by hand |
@@ -406,6 +607,9 @@ key not accepted, unreachable — and the provider's own reply goes to the PHP e
 (`docker compose logs moodle`). It is not shown, since Groq's names the organisation the
 key belongs to.
 - The assistant has its own per-user daily cap.
+- Pictures attached in the assistant are described by a separate vision model
+  (`qwen/qwen3.8-27b`). Groq counts each model's allowance on its own, so this does not use
+  up `gpt-oss`'s.
 
 Ollama with Llama 3.1 was tried first and abandoned as too slow and too weak for the
 chapter-extraction task.
@@ -415,6 +619,10 @@ chapter-extraction task.
 - **Wikipedia API** (`mk` → `en` via language links and redirects) for further reading. No
   key, no quota, but it rate-limits unidentified callers — requests identify themselves
   with the site address and are spaced 2 seconds apart, backing off on `429`.
+- **SearXNG** (`searxng/searxng`, a container in the stack) for web links. It asks Google,
+  Bing, Brave, DuckDuckGo and others at once and needs no key. Any one engine may
+  rate-limit it (in testing DuckDuckGo asked for a CAPTCHA and Brave suspended it for a
+  while); the others still answer.
 
 ---
 
@@ -492,6 +700,8 @@ Book**. A free Groq key works: <https://console.groq.com>
 | Groq model | `openai/gpt-oss-120b` | |
 | AI API key | — | Required for groq, claude, openai |
 | Ollama URL / model | `http://host.docker.internal:11434` | For local models |
+| Groq vision model | `qwen/qwen3.8-27b` | Describes pictures attached in the assistant |
+| Ollama vision model | `llava` | The same, for a local provider |
 | Read book pages with Docling | off | Layout-aware reading and OCR |
 | Docling URL | `http://docling:5001` | Service name inside Docker |
 | Language on the page | `mkd` | Tesseract code; `mkd+eng` for mixed |
@@ -520,12 +730,13 @@ ai_moodle/
     │   ├── index.php            Course structure from the book
     │   ├── lectures.php         Presentation wizard and generation
     │   ├── powerpoint.php       PPTX conversion
-    │   ├── quizzes.php          Lab quizzes and exams
+    │   ├── quizzes.php          Practice quizzes and exams
     │   ├── revise.php           Presentation revision
     │   ├── join.php             Join presentations into one, rewritten from the book
+    │   ├── extras.php           Wikipedia reading and YouTube videos per presentation
     │   ├── chat.php             Assistant endpoint
     │   ├── lib.php              Course nav and the chat widget
-    │   ├── locallib.php         Shared helpers and the tab row
+    │   ├── locallib.php         The work behind every tab, and the tab row
     │   ├── db/hooks.php         Puts the chat widget on course pages
     │   └── classes/
     │       ├── chat.php         Assistant: context building, access control
@@ -533,6 +744,12 @@ ai_moodle/
     │       ├── hook_callbacks.php  The widget's footer hook
     │       ├── reading.php      State of a book's background reading
     │       ├── task/read_book.php  The background task that reads the book
+    │       ├── job.php          Generator work started from the assistant
+    │       ├── task/run_job.php The background task that does it, as the teacher
+    │       ├── videos.php       Find, check and keep YouTube videos
+    │       ├── links.php        Find, check and keep web links from anywhere
+    │       ├── chat_images.php  Pictures attached in the assistant, and their descriptions
+    │       ├── tutor.php        Hard learning: the student's assistant as a tutor
     │       ├── slide_deck.php   Render and parse deck PDFs
     │       ├── pptx_deck.php    Write .pptx as raw OOXML
     │       ├── quiz_builder.php Questions and quizzes into Moodle
@@ -558,6 +775,7 @@ Roughly 5,000 lines of original PHP across the two plugins.
 | `generate_questions()` | Multiple-choice questions from a deck |
 | `ask_model()` | Provider-agnostic call with rate-limit spacing |
 | `chat_with_tools()` | One turn of a conversation with function calling |
+| `describe_image()` | A picture put into words by a vision model |
 
 ---
 
@@ -597,6 +815,11 @@ failure stops the work with Docling's reason rather than falling back to a worse
 
 ## Known limitations
 
+- **One background worker runs everything in turn.** A book being read for an hour holds up
+  any job the assistant started after it; the job waits, it is not lost.
+- **A video search without a YouTube key is expensive.** The web search's results count
+  against the 200,000-token daily allowance; set a YouTube key to make it cheap.
+
 - **No Macedonian OCR model exists** in any engine Docling ships. Tesseract's `mkd` is the
   closest available and is good, but not perfect on a scanned page.
 - **Small text inside raster maps is not recovered.** Docling caps `images_scale` at 2
@@ -617,9 +840,18 @@ failure stops the work with Docling's reason rather than falling back to a worse
   stack's cron runs ad hoc tasks only, but on a site that also runs scheduled tasks,
   `file_temp_cleanup_task` deletes temp files untouched for a week, and the book would be
   read again from the start.
-- **Exams assume up to 12 lectures**, split 1–6 and 7–12.
-- **Revising a deck leaves its PowerPoint and lab quiz stale.** You are warned, and must
+- **Questions are not reviewed before they go in.** Each quiz has its own question bank
+  category, where they can be checked and edited; the model can still mark a wrong answer right.
+- **Drag and drop onto an image, drag and drop markers and the full calculated type** are not
+  generated: the first two need pictures with drop zones placed on them, the last a far more
+  involved setup than calculated simple gives the same result with.
+- **A quiz is written while the page waits**, five questions a minute; sixty take half an hour.
+  The assistant runs the same work in the background.
+- **Revising a deck leaves its PowerPoint and quizzes stale.** You are warned, and must
   delete and rebuild them if you want them to follow.
+- **The assistant sees a picture only through its description.** The vision model copies text
+  well but can miscount or misplace shapes in a diagram; a question about a detail it left out
+  cannot be answered without attaching the picture again.
 - **Tuned against Groq.** The other three providers are wired up but far less exercised.
 
 ---

@@ -113,6 +113,22 @@ services:
       # image ships English alone, so its language directory is supplied here.
       - ./tessdata:/usr/share/tesseract/tessdata:ro
 
+  # Web search for the links offered under each presentation. Google's own search
+  # API takes no new sign-ups and closes on 1 January 2027; this asks Google, Bing,
+  # DuckDuckGo and others at once, needs no key, and answers Moodle alone: it has
+  # no port on the host.
+  searxng:
+    image: searxng/searxng:2026.10.30-ffa88e3ba
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    environment:
+      - SEARXNG_SECRET=${SEARXNG_SECRET}
+      - SEARXNG_BASE_URL=http://searxng:8080/
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    restart: unless-stopped
+
 volumes:
   postgresql_data:
   moodle_data:

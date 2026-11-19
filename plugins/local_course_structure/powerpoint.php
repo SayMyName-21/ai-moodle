@@ -23,97 +23,9 @@ $workdir = local_course_structure_workdir();
 if ($topptx && confirm_sesskey()) {
     \core_php_time_limit::raise(600);
 
-    $decks = local_course_structure_decks($courseid);
-    $targets = ($topptx === -1) ? $decks : array_intersect_key($decks, array($topptx => true));
-    $built = 0;
+    local_course_structure_convert_decks($course, ($topptx === -1) ? null : array($topptx),
+        local_course_structure_page_say());
 
-    foreach ($targets as $deck) {
-        if ($deck->haspptx) {
-            continue;
-        }
-
-        try {
-            $modcontext = context_module::instance($deck->cmid);
-            $sourcefiles = $fs->get_area_files($modcontext->id, 'mod_resource', 'content',
-                0, 'itemid', false);
-            $source = reset($sourcefiles);
-            if (!$source) {
-                throw new Exception('the presentation has no file attached');
-            }
-
-            $pdfpath = $workdir . '/src-' . uniqid() . '.pdf';
-            $source->copy_content_to($pdfpath);
-            // Rebuilding from the PDF keeps this free of any AI request.
-            $slides = \local_course_structure\slide_deck::parse($pdfpath);
-            unlink($pdfpath);
-
-            if (empty($slides)) {
-                throw new Exception('no slides could be read back from the PDF');
-            }
-
-            $pptxpath = $workdir . '/deck-' . uniqid() . '.pptx';
-            \local_course_structure\pptx_deck::render(
-                $deck->name, $deck->chapter, $slides, $pptxpath);
-
-            $draftid = file_get_unused_draft_itemid();
-            $fs->create_file_from_pathname(array(
-                'contextid' => context_user::instance($USER->id)->id,
-                'component' => 'user',
-                'filearea'  => 'draft',
-                'itemid'    => $draftid,
-                'filepath'  => '/',
-                'filename'  => clean_param($deck->name, PARAM_FILE) . '.pptx',
-            ), $pptxpath);
-            unlink($pptxpath);
-
-            $module = $DB->get_record('modules', array('name' => 'resource'), '*', MUST_EXIST);
-
-            $data = new stdClass();
-            $data->course = $course->id;
-            $data->modulename = 'resource';
-            $data->module = $module->id;
-            $data->section = (int)$deck->section;
-            $data->name = $deck->name . ' ' . get_string('powerpointsuffix', 'local_course_structure');
-            $data->intro = '';
-            $data->introformat = FORMAT_HTML;
-            $data->visible = 1;
-            $data->files = $draftid;
-            $data->display = RESOURCELIB_DISPLAY_AUTO;
-            $data->printintro = 0;
-            $data->showsize = 1;
-            $data->showtype = 0;
-            $data->showdate = 0;
-            $data->popupwidth = 620;
-            $data->popupheight = 450;
-            $data->filterfiles = 0;
-            $data->cmidnumber = 'csgenppt-' . $deck->index;
-            $data->groupmode = 0;
-            $data->groupingid = 0;
-            $data->completion = 0;
-            $data->completionview = 0;
-            $data->completionexpected = 0;
-            $data->availabilityconditionsjson = '';
-
-            ob_start();
-            add_moduleinfo($data, $course);
-            ob_end_clean();
-            $built++;
-
-            echo $OUTPUT->notification(
-                get_string('converted', 'local_course_structure', s($deck->name)), 'notifysuccess');
-            flush();
-
-        } catch (Exception $e) {
-            echo $OUTPUT->notification(
-                get_string('lecturefailed', 'local_course_structure', (object)array(
-                    'title' => s($deck->name), 'error' => s($e->getMessage()))), 'notifyerror');
-            flush();
-        }
-    }
-
-    rebuild_course_cache($courseid, true);
-    echo $OUTPUT->notification(
-        get_string('convertdone', 'local_course_structure', $built), 'notifysuccess');
     echo $OUTPUT->continue_button(new moodle_url('/local/course_structure/powerpoint.php',
         array('id' => $courseid)));
     echo $OUTPUT->footer();

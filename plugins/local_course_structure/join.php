@@ -62,90 +62,11 @@ if ($step !== '') {
 
 // Step three: write the joined presentation and add it to the course.
 if ($step === 'build') {
-    $picked = array_values(array_filter(array_unique($picked), function($key) use ($sections) {
-        return isset($sections[$key]);
-    }));
-    sort($picked);
-    if (empty($picked)) {
-        $stop(get_string('joinnosections', 'local_course_structure'));
-    }
-    if ($title === '') {
-        $title = implode(' + ', array_map(function($cmid) use ($decks) {
-            return $decks[$cmid]->name;
-        }, $chosen));
-    }
-    if (!isset($coursetopics[$topic])) {
-        $topic = (int)$decks[$chosen[0]]->section;
-    }
-
-    $plan = \mod_book\ai_service::plan_from_selection($outline, array(
-        array('title' => $title, 'sections' => $picked, 'topic' => $topic)));
-    $presentation = reset($plan);
-
-    echo $OUTPUT->notification(get_string('joinwriting', 'local_course_structure', (object)array(
-        'title' => s($title), 'requests' => count($presentation['chunks']) + 1)), 'notifymessage');
-    flush();
-
-    list($slides, $missed) = local_course_structure_write_slides($bookpath, $outline['offset'],
-        $presentation, function($error) use ($OUTPUT, $title) {
-            echo $OUTPUT->notification(
-                get_string('lecturefailed', 'local_course_structure', (object)array(
-                    'title' => s($title), 'error' => s($error))), 'notifyerror');
-            flush();
-        });
-
-    if (empty($slides)) {
-        $stop(get_string('joinfailed', 'local_course_structure', s($title)));
-    }
-
-    // The divider slides opening each part, which the joining pass leaves alone.
-    $chunktitles = array();
-    foreach ($presentation['chunks'] as $chunk) {
-        $chunktitles[] = $chunk['titles'];
-    }
-    $dividers = array();
-    foreach ($slides as $position => $slide) {
-        if ($slide['heading'] === $title && in_array($slide['bullets'], $chunktitles, true)) {
-            $dividers[] = $position;
-        }
-    }
-
-    $written = count($slides);
     try {
-        $slides = \mod_book\ai_service::join_slides($title, $slides, $dividers);
-        echo $OUTPUT->notification(get_string('joinunified', 'local_course_structure', (object)array(
-            'before' => $written, 'after' => count($slides))), 'notifymessage');
+        $cmid = local_course_structure_join_decks($course, $chosen, $picked, $title, $topic, $hide,
+            local_course_structure_page_say());
     } catch (Exception $e) {
-        // Written from the book part by part, the deck is complete without this
-        // pass; it only reads less as one lecture.
-        echo $OUTPUT->notification(get_string('joinnotunified', 'local_course_structure',
-            s($e->getMessage())), 'notifymessage');
-    }
-    flush();
-
-    // Above any index a run of the Presentations tab hands out, which counts from
-    // 0 in plan order and would otherwise take this deck for one it already built.
-    $index = 1000;
-    foreach ($decks as $deck) {
-        $index = max($index, $deck->index + 1);
-    }
-
-    $cmid = local_course_structure_add_deck($course, $topic, $title,
-        $coursetopics[$topic] ?? '', $slides, 'csgen-' . $index . ($missed > 0 ? '-part' : ''));
-
-    if ($hide) {
-        foreach ($chosen as $old) {
-            set_coursemodule_visible($old, 0);
-        }
-    }
-    rebuild_course_cache($courseid, true);
-
-    echo $OUTPUT->notification(get_string('joined', 'local_course_structure', (object)array(
-        'title' => s($title), 'slides' => count($slides), 'topic' => s($coursetopics[$topic] ?? ''))),
-        'notifysuccess');
-    if ($hide) {
-        echo $OUTPUT->notification(get_string('joinhidden', 'local_course_structure', count($chosen)),
-            'notifymessage');
+        $stop($e->getMessage());
     }
     echo html_writer::link(new moodle_url('/mod/resource/view.php', array('id' => $cmid)),
         get_string('joinopen', 'local_course_structure'), array('class' => 'btn btn-primary mr-2'));
@@ -157,19 +78,10 @@ if ($step === 'build') {
 
 // Step two: the book sections the chosen presentations were built from, to check.
 if ($step === 'check') {
-    $covered = array();
-    $from = array();
-    foreach ($chosen as $cmid) {
-        $slides = local_course_structure_deck_slides($cmid);
-        $found = $slides ? local_course_structure_deck_sections($slides, $sections) : array();
-        if (empty($found)) {
-            echo $OUTPUT->notification(get_string('joinnotraced', 'local_course_structure',
-                s($decks[$cmid]->name)), 'notifymessage');
-        }
-        foreach ($found as $key) {
-            $covered[$key] = true;
-            $from[$key][] = $decks[$cmid]->name;
-        }
+    list($covered, $from, $untraced) = local_course_structure_trace_decks($chosen, $decks, $sections);
+    foreach ($untraced as $name) {
+        echo $OUTPUT->notification(get_string('joinnotraced', 'local_course_structure', s($name)),
+            'notifymessage');
     }
 
     $default = implode(' + ', array_map(function($cmid) use ($decks) {

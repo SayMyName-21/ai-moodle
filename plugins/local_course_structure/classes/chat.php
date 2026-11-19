@@ -111,11 +111,26 @@ class chat {
             require_once(__DIR__ . '/course_agent.php');
             $result = course_agent::run($course, $context, $question, self::teacher_prompt(), $material);
             return array('answer' => $result['answer'], 'used' => $used, 'teacher' => true,
-                'plan' => $result['plan']);
+                'plan' => $result['plan'], 'videos' => $result['videos']);
+        }
+
+        // A picture the student attached - a photo of an exercise, say - is part
+        // of their question, and its room comes out of the material's.
+        require_once(__DIR__ . '/chat_images.php');
+        $pictures = chat_images::text($course->id, false);
+        $material = \core_text::substr($material, 0,
+            max(2000, \core_text::strlen($material) - \core_text::strlen($pictures)));
+
+        // Hard learning, where the teacher has turned it on: guided, never answered.
+        require_once(__DIR__ . '/tutor.php');
+        if (tutor::enabled($course->id)) {
+            $result = tutor::ask($course, $material, $pictures, $question);
+            $result['used'] = $used;
+            return $result;
         }
 
         $prompt = self::student_prompt() .
-            "\n\n=== COURSE: " . $course->fullname . " ===\n" . $material .
+            "\n\n=== COURSE: " . $course->fullname . " ===\n" . $material . $pictures .
             "\n\n=== QUESTION ===\n" . \core_text::substr($question, 0, 1000);
 
         $reply = \mod_book\ai_service::ask_model($prompt, self::ANSWER_TOKENS);
@@ -143,7 +158,8 @@ class chat {
             "asked. Answer in the language the student writes in.\n\n" .
             "Only use the course material given below. If it does not cover the " .
             "question, say so and suggest who to ask, rather than inventing an " .
-            "answer.\n\n" .
+            "answer. A picture the student attached, described below, is part of " .
+            "their question: help them with it as you would with a typed one.\n\n" .
             "You do not have marks, grades, quiz questions or quiz answers, and you " .
             "must not guess at them. If you are asked for any of those, say that you " .
             "cannot help with that and that their teacher can.\n\n" .

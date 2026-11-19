@@ -35,4 +35,15 @@ if ($hassiteconfig) {
         get_string('chatdailylimit', 'local_course_structure'),
         get_string('chatdailylimit_desc', 'local_course_structure'),
         40, PARAM_INT, 6));
+
+    $settings->add(new admin_setting_heading('local_course_structure_videos',
+        get_string('videosettings', 'local_course_structure'), ''));
+
+    $settings->add(new admin_setting_configpasswordunmask('local_course_structure/youtubekey',
+        get_string('youtubekey', 'local_course_structure'),
+        get_string('youtubekey_desc', 'local_course_structure'), ''));
+
+    $settings->add(new admin_setting_configtext('local_course_structure/searxngurl',
+        get_string('searxngurl', 'local_course_structure'),
+        get_string('searxngurl_desc', 'local_course_structure'), 'http://searxng:8080', PARAM_URL));
 }

@@ -1,0 +1,20 @@
+# SearXNG for the course generator's link search. Only Moodle calls it, over the
+# stack's internal network, so it answers in JSON and skips the rate limiter that
+# protects public instances. Everything else is SearXNG's default.
+use_default_settings: true
+
+general:
+  instance_name: "ai-moodle search"
+
+server:
+  # Set from SEARXNG_SECRET in .env.
+  secret_key: "set-from-environment"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  safe_search: 2
+  formats:
+    - html
+    - json

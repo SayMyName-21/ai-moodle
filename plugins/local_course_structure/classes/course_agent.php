@@ -71,6 +71,25 @@ class course_agent {
      */
     public static $trace = array();
 
+    /**
+     * @var array Videos found during the last request, each with the presentation's
+     *            'cmid' and name ('deck') and the 'video', for the teacher to answer.
+     */
+    public static $videos = array();
+
+    /** Web links found this turn, shown to the teacher as the videos are: 'cmid', 'deck' and 'link'. */
+    public static $links = array();
+
+    /** What a generator task becomes when it is carried out. */
+    const TASK_JOBS = array(
+        'build_presentations' => 'presentations',
+        'join_presentations' => 'join',
+        'revise_presentation' => 'revise',
+        'convert_to_powerpoint' => 'powerpoint',
+        'build_quiz' => 'quiz',
+        'add_wikipedia_links' => 'reading',
+    );
+
     /** Form fields that carry no setting of the activity. */
     const FORM_NOISE = '/^(sesskey|_qf__|mform_|submitbutton|cancel|return|sr|add|update|' .
         'coursemodule|module|modulename|instance|course|section|showgradingmanagement|' .
@@ -93,15 +112,21 @@ class course_agent {
         $started = time();
         $actions = array();
         self::$trace = array();
+        self::$videos = array();
+        self::$links = array();
 
         // The free tier counts the whole request against one allowance, which the
         // material was sized to fill on its own; what was said earlier would tip a
-        // follow-up over it, so its room comes out of the material.
-        $history = self::history_text($course->id);
+        // follow-up over it, so its room comes out of the material. So does that of
+        // the generator's rules and tools, which came after the material was sized.
+        require_once(__DIR__ . '/chat_images.php');
+        $history = self::history_text($course->id) . self::attachment_text($course) .
+            chat_images::text($course->id, true);
+        $extra = \core_text::strlen(self::generator_rules() . json_encode(array_slice(self::tools(), -3)));
         $material = \core_text::substr($material, 0,
-            max(2000, \core_text::strlen($material) - \core_text::strlen($history)));
+            max(2000, \core_text::strlen($material) - \core_text::strlen($history) - $extra));
 
-        $system = $prompt . "\n\n" . self::rules() .
+        $system = $prompt . "\n\n" . self::rules() . "\n\n" . self::generator_rules() .
             "\n\n=== COURSE STRUCTURE (with ids) ===\n" . self::structure($course) . $history;
 
         // Said beside the request rather than among the rules: with the course in
@@ -172,9 +197,14 @@ class course_agent {
             }, $actions));
         }
 
-        self::remember($course->id, $question, $answer, array_column($actions, 'summary'), 'proposed');
+        self::remember($course->id, $question, $answer, array_merge(array_column($actions, 'summary'),
+            array_map(function($card) {
+                return 'Video shown to the teacher for "' . $card['deck'] . '": ' . $card['video']['title'];
+            }, self::$videos), array_map(function($card) {
+                return 'Link shown to the teacher for "' . $card['deck'] . '": ' . $card['link']['url'];
+            }, self::$links)), 'proposed');
 
-        return array('answer' => $answer, 'plan' => $plan);
+        return array('answer' => $answer, 'plan' => $plan, 'videos' => self::$videos, 'links' => self::$links);
     }
 
     /**
@@ -183,9 +213,13 @@ class course_agent {
      * The changes go through together or not at all: one that fails takes the
      * others back with it, so a course is never left half changed.
      *
+     * Work for the generator's tabs takes too long to be done here. It is started
+     * once the rest has gone through, each piece as a job in the background.
+     *
      * @param \stdClass $course The course
      * @param string $planid The plan's id
-     * @return array A line for each change made
+     * @return array 'done', a line for each change made or started, and 'jobs',
+     *               the ids of the jobs started
      * @throws \Exception if the plan has lapsed or a change fails
      */
     public static function apply($course, $planid) {
@@ -199,10 +233,17 @@ class course_agent {
         // A plan is carried out once, even if the button is pressed twice.
         unset($SESSION->local_course_structure_plans[$planid]);
 
+        $now = array_values(array_filter($plan['actions'], function($action) {
+            return $action['kind'] !== 'task';
+        }));
+        $later = array_values(array_filter($plan['actions'], function($action) {
+            return $action['kind'] === 'task';
+        }));
+
         $done = array();
         $transaction = $DB->start_delegated_transaction();
         try {
-            foreach ($plan['actions'] as $action) {
+            foreach ($now as $action) {
                 self::execute($course, $action);
                 $done[] = $action['summary'];
             }
@@ -210,7 +251,7 @@ class course_agent {
         } catch (\Throwable $e) {
             // The teacher gets the reason without the query behind it.
             $message = get_string('chatapplyfailed', 'local_course_structure', (object)array(
-                'change' => $plan['actions'][count($done)]['summary'],
+                'change' => $now[count($done)]['summary'],
                 'error' => \core_text::substr(strtok($e->getMessage(), "\n"), 0, 300),
             ));
             try {
@@ -227,8 +268,35 @@ class course_agent {
         }
 
         rebuild_course_cache($course->id, true);
+
+        // Topics made from the chapters found end that reading, as on its own page.
+        foreach ($now as $action) {
+            if ($action['kind'] === 'topics') {
+                reading::clear($course->id);
+            }
+        }
+
+        // Started after the changes above are in, so a presentation built in the
+        // background lands in a topic created in the same plan.
+        $jobs = array();
+        $failed = array();
+        foreach ($later as $action) {
+            try {
+                $job = self::launch($course, $action);
+                if ($job !== null) {
+                    $jobs[] = $job;
+                }
+                $done[] = $action['summary'];
+            } catch (\Throwable $e) {
+                $failed[] = $action['summary'] . ': ' . \core_text::substr($e->getMessage(), 0, 300);
+            }
+        }
+
         self::remember($course->id, '', '', $done, 'applied');
-        return $done;
+        if (!empty($failed)) {
+            self::remember($course->id, '', '', $failed, 'failed');
+        }
+        return array('done' => $done, 'jobs' => $jobs, 'failed' => $failed);
     }
 
     /**
@@ -269,9 +337,12 @@ class course_agent {
             "- For an activity's settings (dates, time limit, attempts, name, " .
             "description, grade...), read them with get_activity_settings, then use " .
             "propose_activity_settings with the field names it shows.\n" .
-            "- For a new activity use propose_new_activity, for a topic's name or " .
-            "description propose_section_update, and for quiz questions " .
-            "propose_quiz_questions.\n" .
+            "- For a new activity use propose_new_activity, and for a topic's name or " .
+            "description propose_section_update.\n" .
+            "- A quiz or exam on the course's material - any question types, any number of questions - is " .
+            "always propose_generator_task build_quiz, which writes the questions from the slides and the book. " .
+            "Do not write such questions yourself. propose_quiz_questions and the questions of " .
+            "propose_new_activity are only for multiple choice questions the teacher dictates word for word.\n" .
             "- To save something you wrote earlier in this conversation - a lesson plan, " .
             "notes, a handout - into the course, use propose_page_from_answer, which saves " .
             "it word for word. Asked to write something and save it in one go, write it in " .
@@ -287,6 +358,9 @@ class course_agent {
             "enrol_manual_enrol_users, core_enrol_get_enrolled_users, " .
             "core_grades_update_grades, mod_quiz_get_quizzes_by_courses, " .
             "core_calendar_create_calendar_events.\n" .
+            "- A picture under PICTURES ATTACHED goes into the course with propose_image. Its description " .
+            "can also be used like any other material, for example to write quiz questions about a diagram " .
+            "or to turn a photographed worksheet into a page.\n" .
             "- Never set a password. For a new user, leave password out and set " .
             "createpassword to 1: Moodle makes one and emails it to them.\n" .
             "- When you are done, answer in plain text, not JSON, in the language the " .
@@ -294,7 +368,47 @@ class course_agent {
     }
 
     /**
+     * What the model is told about the generator's tabs, which it can also use.
+     *
+     * @return string
+     */
+    private static function generator_rules() {
+        return "YOU CAN ALSO DO EVERYTHING ON THE COURSE GENERATOR'S TABS (Course structure, Presentations, " .
+            "Join, Revise, PowerPoint, Quizzes and exams, Videos and reading):\n" .
+            "- Look up with generator_info: presentations (each with its cmid, and whether it has a PowerPoint, " .
+            "a lab quiz, reading links and videos), book_sections (the parts of the book presentations are " .
+            "written from, by key), book_status (the course book's reading and the chapters it found), slides " .
+            "(one presentation's slides; give cmid), jobs (background work and how far it has got).\n" .
+            "- Propose the work with propose_generator_task. Most of it takes minutes to an hour, so after " .
+            "Apply it runs in the background; say so, and that the teacher can ask you how it is going. Tasks: " .
+            "build_presentations (presentations: [{title, sections: keys from book_sections, topic: topic " .
+            "number}], wikipedia_links, replace_existing), join_presentations (cmids: two or more; optional " .
+            "sections, title, topic; hide_originals, default true), revise_presentation (cmid; request: the " .
+            "change in the teacher's words), convert_to_powerpoint and add_wikipedia_links " .
+            "(optional cmids, else all), build_quiz (cmids it covers, else all; quiz: kind practice - every " .
+            "question, checked as answered - or exam - a pool, each attempt drawing shown of them; count, types " .
+            "from multichoice, truefalse, match, ordering, shortanswer, numerical, essay, randomsamatch, ddwtos, " .
+            "gapselect, multianswer, calculatedmulti, calculatedsimple; instructions; use_book, default true; " .
+            "exam time_limit and attempts; optional title and topic. Ask what kind and which presentations if " .
+            "the teacher has not said), read_book_again (guidance: what the chapter detection got " .
+            "wrong), create_course_topics (optional topics: titles in order, else the chapters found; " .
+            "include_subtopics), use_attached_book (include_subtopics).\n" .
+            "- For a video to go with a presentation, call find_video with its cmid and what the teacher " .
+            "wants. It searches YouTube and shows the teacher a video to accept or decline themselves; propose " .
+            "nothing for it, and do not offer to add it: the Accept button under the video does that. Videos are " .
+            "added as links unless the teacher asks for an embedded player; then pass embed true. To switch a " .
+            "video already added between link and player, use propose_video_display with its id from " .
+            "generator_info presentations. Asked for another, call find_video again with what they want instead.\n" .
+            "- For a web page to go with a presentation, call find_link with its cmid: it searches the web and " .
+            "shows the teacher the closest matching page to accept or decline, as with videos. If the teacher " .
+            "gives a link of their own, pass it as url and it is opened, checked and shown the same way. Asked " .
+            "for another, call find_link again with what they want instead. Propose nothing for it.";
+    }
+
+    /**
      * The tools the model may call, in chat completion form.
+     *
+     * The generator's three come last, which run() relies on to know their size.
      *
      * @return array
      */
@@ -344,7 +458,7 @@ class course_agent {
                 'Propose adding an activity. type is the module name: page, url, label, quiz, ' .
                 'assign, forum, folder, choice, feedback, glossary, lesson, h5pactivity... For a ' .
                 'page give settings.content; for a url settings.externalurl; for a label ' .
-                'settings.intro. For a quiz, questions may be given to put in it.',
+                'settings.intro. Not for a quiz on the course material: that is build_quiz.',
                 array(
                     'type' => array('type' => 'string'),
                     'section' => array('type' => 'integer', 'description' => 'Topic number'),
@@ -379,10 +493,97 @@ class course_agent {
                 ),
                 array('section', 'summary')),
             $tool('propose_quiz_questions',
-                'Propose adding multiple-choice questions to a quiz.',
+                'Propose adding multiple choice questions the teacher dictated to an existing quiz. To have ' .
+                'questions written from the material, use build_quiz instead.',
                 array('cmid' => array('type' => 'integer'), 'questions' => self::question_schema(),
                     'summary' => $summary),
                 array('cmid', 'questions', 'summary')),
+            $tool('propose_image',
+                'Propose putting a picture attached in this conversation into the course: as a new label ' .
+                'in a topic (where new_label), at the end of an existing page or label (where ' .
+                'page_or_label, with its cmid), or at the end of a topic\'s description (where ' .
+                'topic_description).',
+                array(
+                    'image' => array('type' => 'integer', 'description' => '1 for the latest picture'),
+                    'where' => array('type' => 'string',
+                        'enum' => array('new_label', 'page_or_label', 'topic_description')),
+                    'section' => array('type' => 'integer', 'description' => 'Topic number'),
+                    'cmid' => array('type' => 'integer'),
+                    'caption' => array('type' => 'string', 'description' => 'Shown under it, if wanted'),
+                    'alt' => array('type' => 'string',
+                        'description' => 'Short text for those who cannot see it, in the course\'s language'),
+                    'visible' => array('type' => 'boolean', 'description' => 'For a new label; default true'),
+                    'summary' => $summary,
+                ),
+                array('where', 'alt', 'summary')),
+            $tool('propose_video_display',
+                'Propose showing a video already under a presentation as an embedded player or as a link.',
+                array(
+                    'cmid' => array('type' => 'integer', 'description' => 'The presentation'),
+                    'video' => array('type' => 'string', 'description' => 'YouTube id, from generator_info'),
+                    'embed' => array('type' => 'boolean', 'description' => 'True for a player, false for a link'),
+                    'summary' => $summary,
+                ),
+                array('cmid', 'video', 'embed', 'summary')),
+            $tool('generator_info', 'Look up the course generator\'s presentations, book, jobs or slides.',
+                array(
+                    'what' => array('type' => 'string',
+                        'enum' => array('presentations', 'book_sections', 'book_status', 'slides', 'jobs')),
+                    'cmid' => array('type' => 'integer', 'description' => 'For slides'),
+                ),
+                array('what')),
+            $tool('propose_generator_task', 'Propose work from the generator\'s tabs; see the rules for each task.',
+                array(
+                    'task' => array('type' => 'string', 'enum' => array_merge(array_keys(self::TASK_JOBS),
+                        array('read_book_again', 'create_course_topics', 'use_attached_book'))),
+                    'presentations' => array('type' => 'array', 'items' => array('type' => 'object',
+                        'properties' => array(
+                            'title' => array('type' => 'string'),
+                            'sections' => array('type' => 'array', 'items' => array('type' => 'integer')),
+                            'topic' => array('type' => 'integer'),
+                        ))),
+                    'cmids' => array('type' => 'array', 'items' => array('type' => 'integer')),
+                    'cmid' => array('type' => 'integer'),
+                    'sections' => array('type' => 'array', 'items' => array('type' => 'integer')),
+                    'title' => array('type' => 'string'),
+                    'topic' => array('type' => 'integer'),
+                    'request' => array('type' => 'string'),
+                    'guidance' => array('type' => 'string'),
+                    'topics' => array('type' => 'array', 'items' => array('type' => 'string')),
+                    'wikipedia_links' => array('type' => 'boolean'),
+                    'replace_existing' => array('type' => 'boolean'),
+                    'hide_originals' => array('type' => 'boolean'),
+                    'include_subtopics' => array('type' => 'boolean'),
+                    'quiz' => array('type' => 'object', 'description' => 'For build_quiz', 'properties' => array(
+                        'kind' => array('type' => 'string', 'enum' => array('practice', 'exam')),
+                        'count' => array('type' => 'integer', 'description' => 'Questions to write (exam: pool size)'),
+                        'shown' => array('type' => 'integer', 'description' => 'Exam: questions per attempt, 0 for half'),
+                        'types' => array('type' => 'array', 'items' => array('type' => 'string',
+                            'enum' => quiz_builder::TYPES)),
+                        'instructions' => array('type' => 'string'),
+                        'use_book' => array('type' => 'boolean'),
+                        'time_limit' => array('type' => 'integer', 'description' => 'Exam: minutes, 0 for none'),
+                        'attempts' => array('type' => 'integer', 'description' => 'Exam: 0 for unlimited'),
+                    )),
+                    'summary' => $summary,
+                ),
+                array('task', 'summary')),
+            $tool('find_video', 'Search YouTube for a video to go with a presentation, and show it to the teacher.',
+                array(
+                    'cmid' => array('type' => 'integer'),
+                    'instructions' => array('type' => 'string', 'description' => 'What the teacher wants, if anything'),
+                    'embed' => array('type' => 'boolean',
+                        'description' => 'True only if the teacher asked for an embedded player rather than a link'),
+                ),
+                array('cmid')),
+            $tool('find_link', 'Search the web for a page to link under a presentation, or check a link the ' .
+                'teacher gave, and show it to the teacher to accept or decline.',
+                array(
+                    'cmid' => array('type' => 'integer'),
+                    'instructions' => array('type' => 'string', 'description' => 'What the teacher wants, if anything'),
+                    'url' => array('type' => 'string', 'description' => 'A link the teacher gave, to check instead of searching'),
+                ),
+                array('cmid')),
         );
     }
 
@@ -424,6 +625,14 @@ class course_agent {
                         (array)($args['arguments'] ?? array()));
                 case 'get_activity_settings':
                     return self::activity_settings($course, (int)($args['cmid'] ?? 0));
+                case 'generator_info':
+                    return self::generator_info($course, (string)($args['what'] ?? ''), (int)($args['cmid'] ?? 0));
+                case 'find_video':
+                    return self::find_video($course, (int)($args['cmid'] ?? 0), (string)($args['instructions'] ?? ''),
+                        !empty($args['embed']));
+                case 'find_link':
+                    return self::find_link($course, (int)($args['cmid'] ?? 0), (string)($args['instructions'] ?? ''),
+                        trim((string)($args['url'] ?? '')));
             }
 
             $action = self::proposal($name, $args, $course);
@@ -500,6 +709,36 @@ class course_agent {
                 }
                 return array('kind' => 'questions', 'cmid' => (int)($args['cmid'] ?? 0),
                     'questions' => $questions, 'summary' => $summary);
+
+            case 'propose_generator_task':
+                return self::generator_task($course, $args, $summary);
+
+            case 'propose_video_display':
+                $cmid = (int)($args['cmid'] ?? 0);
+                $id = (string)($args['video'] ?? '');
+                if (!in_array($id, array_column(videos::deck($course->id, $cmid)['accepted'], 'id'), true)) {
+                    throw new \Exception('Video ' . $id . ' is not under presentation ' . $cmid .
+                        '. See generator_info presentations.');
+                }
+                return array('kind' => 'videodisplay', 'cmid' => $cmid, 'video' => $id,
+                    'embed' => !empty($args['embed']), 'summary' => $summary);
+
+            case 'propose_image':
+                // Kept by file rather than by number, which moves on when another
+                // picture is attached before the teacher presses Apply.
+                $picture = chat_images::get($course, (int)($args['image'] ?? 1));
+                $where = (string)($args['where'] ?? '');
+                if (!in_array($where, array('new_label', 'page_or_label', 'topic_description'), true)) {
+                    throw new \Exception('where must be new_label, page_or_label or topic_description.');
+                }
+                $alt = trim((string)($args['alt'] ?? ''));
+                return array('kind' => 'image', 'fileid' => (int)$picture['file']->get_id(),
+                    'filename' => $picture['file']->get_filename(), 'where' => $where,
+                    'section' => (int)($args['section'] ?? 0), 'cmid' => (int)($args['cmid'] ?? 0),
+                    'caption' => trim((string)($args['caption'] ?? '')),
+                    'alt' => $alt !== '' ? \core_text::substr($alt, 0, 200) : $picture['file']->get_filename(),
+                    'visible' => !isset($args['visible']) || !empty($args['visible']),
+                    'summary' => $summary);
         }
 
         throw new \Exception('There is no tool called ' . $name . '.');
@@ -597,8 +836,9 @@ class course_agent {
         global $DB;
 
         // A web service function is checked against its parameters instead: some
-        // send messages or mail, which a rollback does not call back.
-        if ($action['kind'] === 'function') {
+        // send messages or mail, which a rollback does not call back. Generator
+        // work was checked as it was proposed, and is far too slow to try out.
+        if ($action['kind'] === 'function' || $action['kind'] === 'task' || $action['kind'] === 'videodisplay') {
             return;
         }
 
@@ -647,8 +887,605 @@ class course_agent {
                 $cm = get_coursemodule_from_id('quiz', $action['cmid'], $course->id, false, MUST_EXIST);
                 self::add_questions($course, $cm, $action['questions']);
                 return;
+            case 'topics':
+                self::generator();
+                require_capability('moodle/course:update', \context_course::instance($course->id));
+                local_course_structure_apply($course->id, $action['chapters'], $action['subtopics']);
+                return;
+            case 'image':
+                self::add_image($course, $action);
+                return;
+            case 'videodisplay':
+                require_capability('moodle/course:update', \context_course::instance($course->id));
+                videos::set_display($course, $action['cmid'], $action['video'], $action['embed']);
+                return;
         }
         throw new \Exception('Unknown kind of change.');
+    }
+
+    /**
+     * Load what the generator's work is built from.
+     */
+    private static function generator() {
+        global $CFG;
+        require_once($CFG->dirroot . '/mod/book/classes/ai_service.php');
+        require_once($CFG->dirroot . '/local/course_structure/locallib.php');
+    }
+
+    /**
+     * Answer generator_info.
+     *
+     * @param \stdClass $course The course
+     * @param string $what presentations, book_sections, book_status, slides or jobs
+     * @param int $cmid The presentation, for slides
+     * @return string
+     */
+    private static function generator_info($course, $what, $cmid) {
+        self::generator();
+        $context = \context_course::instance($course->id);
+        require_capability('moodle/course:update', $context);
+        $decks = local_course_structure_decks($course->id);
+
+        switch ($what) {
+            case 'presentations':
+                if (empty($decks)) {
+                    return 'No presentations have been built yet.';
+                }
+                $modinfo = get_fast_modinfo($course);
+                $lines = array();
+                foreach ($decks as $deck) {
+                    $videos = videos::deck($course->id, $deck->cmid);
+                    $lines[] = 'cmid ' . $deck->cmid . ': "' . $deck->name . '" in topic ' . $deck->section .
+                        ' (' . $deck->chapter . ')' . ($modinfo->get_cm($deck->cmid)->visible ? '' : ' [hidden]') .
+                        '; PowerPoint: ' . ($deck->haspptx ? 'yes' : 'no') .
+                        '; quiz: ' . (local_course_structure_deck_has_quiz($course->id, $deck) ? 'yes' : 'no') .
+                        '; reading links: ' . (self::deck_has_reading($deck->cmid) ? 'yes' : 'no') .
+                        '; videos: ' . (empty($videos['accepted']) ? 'none' : implode(', ', array_map(function($video) {
+                            return $video['id'] . ' "' . $video['title'] . '" as ' .
+                                (videos::embedded($video) ? 'player' : 'link');
+                        }, $videos['accepted']))) . ($videos['suggestion'] ? ' (one awaiting an answer)' : '') .
+                        '; web links: ' . (function($links) {
+                            return (empty($links['accepted']) ? 'none' : implode(', ', array_column($links['accepted'], 'url'))) .
+                                ($links['suggestion'] ? ' (one awaiting an answer)' : '');
+                        })(links::deck($course->id, $deck->cmid));
+                }
+                foreach (local_course_structure_quizzes($course->id) as $cmid => $quiz) {
+                    $lines[] = 'Quiz cmid ' . $cmid . ': "' . $modinfo->get_cm($cmid)->name . '", ' . $quiz['kind'] .
+                        ', from cmids ' . implode(', ', $quiz['decks']);
+                }
+                return implode("\n", $lines);
+
+            case 'book_sections':
+                list(, , $sections) = local_course_structure_open_book($context);
+                $lines = array();
+                $chapter = null;
+                foreach ($sections as $key => $section) {
+                    if ($section['chapter'] !== $chapter) {
+                        $chapter = $section['chapter'];
+                        $lines[] = 'Chapter: ' . $chapter;
+                    }
+                    $lines[] = '  key ' . $key . ': ' . $section['title'] . ' (' . count($section['lessons']) . ' lessons)';
+                }
+                return $lines ? implode("\n", $lines) : get_string('nosectionsfound', 'local_course_structure');
+
+            case 'book_status':
+                $book = self::book_file($context);
+                $reading = reading::get($course->id);
+                $lines = array('Stored book: ' . ($book ? $book->get_filename() : 'none'));
+                $attached = self::attachment($course);
+                if ($attached) {
+                    $lines[] = 'Attached in this conversation, not yet used: ' . $attached->get_filename();
+                }
+                if ($reading) {
+                    $lines[] = 'Reading: ' . $reading['status'] .
+                        (!empty($reading['guidance']) ? ' (guidance: ' . $reading['guidance'] . ')' : '');
+                    if (in_array($reading['status'], array('queued', 'reading'), true)) {
+                        $progress = \mod_book\ai_service::reading_progress($reading['contenthash']);
+                        $lines[] = 'Pages read: ' . $progress['read'] . ' of ' . ($progress['total'] ?: '?');
+                    }
+                    if ($reading['status'] === 'failed') {
+                        $lines[] = 'Error: ' . ($reading['error'] ?? '');
+                    }
+                    if ($reading['status'] === 'ready') {
+                        $lines[] = 'Chapters found, awaiting create_course_topics:';
+                        foreach ($reading['proposal'] as $n => $chapter) {
+                            $lines[] = '  ' . ($n + 1) . '. ' . $chapter['title'];
+                        }
+                    }
+                } else if ($book) {
+                    $ready = \mod_book\ai_service::reading_progress($book->get_contenthash())['done'];
+                    $lines[] = $ready ? 'Read through; presentations can be built from it.'
+                        : 'Not read through yet.';
+                }
+                return implode("\n", $lines);
+
+            case 'slides':
+                if (!isset($decks[$cmid])) {
+                    return 'ERROR: there is no presentation with cmid ' . $cmid . '.';
+                }
+                $text = '"' . $decks[$cmid]->name . '"' . "\n";
+                foreach (local_course_structure_deck_slides($cmid) as $number => $slide) {
+                    $text .= ($number + 1) . '. ' . $slide['heading'] . "\n";
+                    foreach ($slide['bullets'] as $bullet) {
+                        $text .= '   - ' . $bullet . "\n";
+                    }
+                }
+                return $text;
+
+            case 'jobs':
+                $jobs = array_slice(job::all($course->id), 0, 8);
+                if (empty($jobs)) {
+                    return 'No background work has been started from here.';
+                }
+                return implode("\n", array_map(function($job) {
+                    return userdate($job['queued'], '%Y-%m-%d %H:%M') . ' ' . job::describe($job);
+                }, $jobs));
+        }
+        return 'ERROR: ask for presentations, book_sections, book_status, slides or jobs.';
+    }
+
+    /**
+     * Whether a presentation lists further reading.
+     *
+     * @param int $cmid The presentation
+     * @return bool
+     */
+    private static function deck_has_reading($cmid) {
+        global $DB;
+        $intro = $DB->get_field_sql("SELECT r.intro FROM {resource} r
+            JOIN {course_modules} cm ON cm.instance = r.id WHERE cm.id = :cmid", array('cmid' => $cmid));
+        return local_course_structure_has_reading((string)$intro);
+    }
+
+    /**
+     * Turn a propose_generator_task call into work waiting for the teacher.
+     *
+     * Everything that can be checked is checked here, so the model hears about a
+     * mistake at once rather than the teacher hearing about it from a job that
+     * failed in the background. The details shown to the teacher say what will
+     * actually be done: the book's parts by name, the presentations by title.
+     *
+     * @param \stdClass $course The course
+     * @param array $args The call's arguments
+     * @param string $summary The model's summary
+     * @return array The change
+     * @throws \Exception if the task cannot be done as asked
+     */
+    private static function generator_task($course, $args, $summary) {
+        self::generator();
+        $courseid = (int)$course->id;
+        $context = \context_course::instance($courseid);
+        require_capability('moodle/course:update', $context);
+
+        $task = (string)($args['task'] ?? '');
+        $decks = local_course_structure_decks($courseid);
+        $topics = local_course_structure_course_topics($course);
+
+        $pick = function($ids) use ($decks) {
+            $ids = array_values(array_unique(array_map('intval', (array)$ids)));
+            foreach ($ids as $id) {
+                if (!isset($decks[$id])) {
+                    throw new \Exception('There is no presentation with cmid ' . $id .
+                        '. See generator_info presentations.');
+                }
+            }
+            return $ids;
+        };
+        $names = function($ids) use ($decks) {
+            return implode(', ', array_map(function($id) use ($decks) {
+                return '"' . $decks[$id]->name . '"';
+            }, $ids));
+        };
+        $keys = function($given, $sections) {
+            $given = array_values(array_unique(array_map('intval', (array)$given)));
+            foreach ($given as $key) {
+                if (!isset($sections[$key])) {
+                    throw new \Exception('There is no book section ' . $key . '. Use keys from generator_info book_sections.');
+                }
+            }
+            sort($given);
+            return $given;
+        };
+        $topicname = function($topic) use ($topics) {
+            if (!isset($topics[$topic])) {
+                throw new \Exception('The course has no topic ' . $topic . '.');
+            }
+            return 'topic ' . $topic . ' (' . $topics[$topic] . ')';
+        };
+        $all = empty($args['cmids']);
+        $chosen = $all ? array_keys($decks) : $pick($args['cmids']);
+
+        $lines = array();
+        $params = array();
+
+        switch ($task) {
+            case 'build_presentations':
+                list(, $outline, $sections) = local_course_structure_open_book($context);
+                $groups = array();
+                foreach (array_values((array)($args['presentations'] ?? array())) as $n => $given) {
+                    $given = (array)$given;
+                    $picked = $keys($given['sections'] ?? array(), $sections);
+                    if (empty($picked)) {
+                        throw new \Exception('Presentation ' . ($n + 1) . ' has no sections. Use keys from ' .
+                            'generator_info book_sections.');
+                    }
+                    $title = trim((string)($given['title'] ?? ''));
+                    if ($title === '') {
+                        $title = (count($picked) === 1) ? $sections[$picked[0]]['title']
+                            : get_string('lecturenumber', 'local_course_structure', $n + 1);
+                    }
+                    $topic = isset($given['topic']) ? (int)$given['topic'] : null;
+                    $groups[] = array('title' => $title, 'sections' => $picked, 'topic' => $topic);
+                    $lines[] = ($n + 1) . '. "' . $title . '"' . ($topic !== null ? ', in ' . $topicname($topic) : '') .
+                        ', from: ' . implode('; ', array_map(function($key) use ($sections) {
+                            return $sections[$key]['title'];
+                        }, $picked));
+                }
+                if (empty($groups)) {
+                    throw new \Exception('Give the presentations to build, each with its sections.');
+                }
+
+                $requests = 0;
+                foreach (\mod_book\ai_service::plan_from_selection($outline, $groups) as $presentation) {
+                    $requests += count($presentation['chunks']);
+                }
+                $lines[] = get_string('chattaskrequests', 'local_course_structure', (object)array(
+                    'requests' => $requests,
+                    'minutes' => (int)ceil($requests * \mod_book\ai_service::REQUEST_SPACING / 60)));
+
+                $replace = !empty($args['replace_existing']);
+                // Added after what is there, unless that is being cleared: positions
+                // already built are skipped, so new presentations at them would not be.
+                $first = 0;
+                if (!$replace) {
+                    foreach ($decks as $deck) {
+                        if ($deck->index < 1000) {
+                            $first = max($first, $deck->index + 1);
+                        }
+                    }
+                } else if (!empty($decks)) {
+                    $lines[] = get_string('chattaskreplace', 'local_course_structure', count($decks));
+                }
+                if (!empty($args['wikipedia_links'])) {
+                    $lines[] = get_string('chattaskwikipedia', 'local_course_structure');
+                }
+                $params = array('groups' => $groups, 'sources' => !empty($args['wikipedia_links']),
+                    'replace' => $replace, 'first' => $first);
+                break;
+
+            case 'join_presentations':
+                $chosen = $all ? array() : $chosen;
+                if (count($chosen) < 2) {
+                    throw new \Exception(get_string('joinneedtwo', 'local_course_structure'));
+                }
+                list(, , $sections) = local_course_structure_open_book($context);
+                if (!empty($args['sections'])) {
+                    $picked = $keys($args['sections'], $sections);
+                } else {
+                    list($covered, , $untraced) = local_course_structure_trace_decks($chosen, $decks, $sections);
+                    if (!empty($untraced)) {
+                        throw new \Exception('Could not tell which parts of the book ' . implode(', ', $untraced) .
+                            ' came from. Ask the teacher which, then give sections (keys from generator_info book_sections).');
+                    }
+                    $picked = array_keys($covered);
+                    sort($picked);
+                }
+                $title = trim((string)($args['title'] ?? ''));
+                if ($title === '') {
+                    $title = implode(' + ', array_map(function($id) use ($decks) {
+                        return $decks[$id]->name;
+                    }, $chosen));
+                }
+                $topic = isset($args['topic']) ? (int)$args['topic'] : (int)$decks[$chosen[0]]->section;
+                $hide = array_key_exists('hide_originals', $args) ? !empty($args['hide_originals']) : true;
+                $lines[] = get_string('chattaskjoin', 'local_course_structure', $names($chosen));
+                $lines[] = '"' . $title . '", in ' . $topicname($topic);
+                $lines[] = get_string('chattaskfrom', 'local_course_structure', implode('; ',
+                    array_map(function($key) use ($sections) {
+                        return $sections[$key]['title'];
+                    }, $picked)));
+                $lines[] = get_string($hide ? 'chattaskhide' : 'chattaskkeep', 'local_course_structure');
+                $params = array('cmids' => $chosen, 'sections' => $picked, 'title' => $title,
+                    'topic' => $topic, 'hide' => $hide);
+                break;
+
+            case 'revise_presentation':
+                $cmid = $pick(array((int)($args['cmid'] ?? 0)))[0];
+                $request = trim((string)($args['request'] ?? ''));
+                if ($request === '') {
+                    throw new \Exception('Give the change to make as request, in the teacher\'s words.');
+                }
+                $lines[] = '"' . $decks[$cmid]->name . '": ' . $request;
+                if ($decks[$cmid]->haspptx || local_course_structure_deck_has_quiz($courseid, $decks[$cmid])) {
+                    $lines[] = get_string('revisestale', 'local_course_structure');
+                }
+                $params = array('cmid' => $cmid, 'request' => $request);
+                break;
+
+            case 'convert_to_powerpoint':
+                $chosen = array_values(array_filter($chosen, function($id) use ($decks) {
+                    return !$decks[$id]->haspptx;
+                }));
+                if (empty($chosen)) {
+                    throw new \Exception(empty($decks) ? get_string('nodecksyet', 'local_course_structure')
+                        : 'Every presentation asked for already has a PowerPoint version.');
+                }
+                $lines[] = $names($chosen);
+                $params = array('cmids' => $chosen);
+                break;
+
+            case 'build_quiz':
+                if (empty($chosen)) {
+                    throw new \Exception(get_string('nodecksyet', 'local_course_structure'));
+                }
+                $quiz = (array)($args['quiz'] ?? array());
+                $kind = (($quiz['kind'] ?? '') === 'exam') ? 'exam' : 'practice';
+                $types = array_values(array_intersect(quiz_builder::TYPES, (array)($quiz['types'] ?? array())));
+                if (empty($types)) {
+                    $types = array('multichoice', 'truefalse', 'match', 'shortanswer');
+                }
+                $count = max(1, min(LOCAL_COURSE_STRUCTURE_QUIZ_MAX, (int)($quiz['count'] ?? 10)));
+                $topic = isset($args['topic']) ? (int)$args['topic'] : -1;
+                if ($topic >= 0) {
+                    $topicname($topic);
+                }
+                $params = array('kind' => $kind, 'cmids' => $chosen, 'count' => $count,
+                    'shown' => (int)($quiz['shown'] ?? 0), 'types' => $types,
+                    'instructions' => trim((string)($quiz['instructions'] ?? '')),
+                    'name' => trim((string)($args['title'] ?? '')), 'topic' => $topic,
+                    'usebook' => !array_key_exists('use_book', $quiz) || !empty($quiz['use_book']),
+                    'timelimit' => (int)($quiz['time_limit'] ?? 0), 'attempts' => (int)($quiz['attempts'] ?? 1));
+                $typenames = quiz_builder::type_names();
+                $lines[] = get_string('quizkind' . $kind, 'local_course_structure') . ($params['name'] !== '' ?
+                    ' "' . $params['name'] . '"' : '') . ($topic >= 0 ? ', in ' . $topicname($topic) : '');
+                $lines[] = get_string('quizcovers', 'local_course_structure', $names($chosen));
+                $lines[] = $count . ' questions' . ($kind === 'exam' ? ', ' . ($params['shown'] ?: 'half') .
+                    ' per attempt, ' . ($params['timelimit'] ? $params['timelimit'] . ' minutes' : 'no time limit') .
+                    ', ' . ($params['attempts'] ?: 'unlimited') . ' attempt(s)' : '') . ': ' .
+                    implode(', ', array_map(function($type) use ($typenames) {
+                        return $typenames[$type];
+                    }, $types));
+                if ($params['instructions'] !== '') {
+                    $lines[] = 'Instructions: ' . $params['instructions'];
+                }
+                $lines[] = $params['usebook'] ? 'From the slides and the book pages behind them.' : 'From the slides only.';
+                break;
+
+
+            case 'add_wikipedia_links':
+                if (empty($chosen)) {
+                    throw new \Exception(get_string('nodecksyet', 'local_course_structure'));
+                }
+                $lines[] = $names($chosen);
+                $lines[] = get_string('chattaskreading', 'local_course_structure');
+                $params = array('cmids' => $chosen);
+                break;
+
+            case 'read_book_again':
+                $book = self::book_file($context);
+                if (!$book) {
+                    throw new \Exception(get_string('nobookstored', 'local_course_structure'));
+                }
+                $guidance = trim((string)($args['guidance'] ?? ''));
+                if ($guidance === '') {
+                    throw new \Exception('Give guidance: what the chapter detection got wrong, in the teacher\'s words.');
+                }
+                $lines[] = $book->get_filename() . ': ' . $guidance;
+                $params = array('guidance' => $guidance);
+                break;
+
+            case 'create_course_topics':
+                $reading = reading::get($courseid);
+                $proposal = (($reading['status'] ?? '') === 'ready') ? $reading['proposal'] : array();
+                $summaries = array();
+                foreach ($proposal as $chapter) {
+                    $summaries[trim($chapter['title'])] = $chapter['summary'] ?? '';
+                }
+                $titles = empty($args['topics']) ? array_column($proposal, 'title') : (array)$args['topics'];
+                $chapters = array();
+                foreach ($titles as $title) {
+                    $title = trim(clean_param((string)$title, PARAM_TEXT));
+                    if ($title !== '') {
+                        $chapters[] = array('title' => $title, 'summary' => $summaries[$title] ?? '');
+                    }
+                }
+                if (empty($chapters)) {
+                    throw new \Exception('Give the topics, or read the book first: no chapters are waiting to ' .
+                        'be made into topics (see generator_info book_status).');
+                }
+                $subtopics = array_key_exists('include_subtopics', $args) ? !empty($args['include_subtopics'])
+                    : (bool)($reading['includesubtopics'] ?? true);
+                foreach ($chapters as $n => $chapter) {
+                    $lines[] = 'Topic ' . ($n + 1) . ': ' . $chapter['title'];
+                }
+                $lines[] = get_string('chattasktopics', 'local_course_structure');
+                return array('kind' => 'topics', 'chapters' => $chapters, 'subtopics' => $subtopics,
+                    'lines' => $lines, 'summary' => $summary);
+
+            case 'use_attached_book':
+                $file = self::attachment($course);
+                if (!$file) {
+                    throw new \Exception('No file is attached. Ask the teacher to attach the book with the ' .
+                        'paperclip button under the chat, then ask again.');
+                }
+                $stored = self::book_file($context);
+                $lines[] = $file->get_filename() . ' (' . display_size($file->get_filesize()) . ')';
+                if ($stored) {
+                    $lines[] = get_string('chattaskreplacebook', 'local_course_structure', $stored->get_filename());
+                }
+                $lines[] = get_string('step2', 'local_course_structure');
+                $params = array('subtopics' => array_key_exists('include_subtopics', $args)
+                    ? !empty($args['include_subtopics']) : true);
+                break;
+
+            default:
+                throw new \Exception('There is no generator task called "' . $task . '".');
+        }
+
+        return array('kind' => 'task', 'task' => $task, 'params' => $params, 'lines' => $lines,
+            'summary' => $summary);
+    }
+
+    /**
+     * Start approved generator work.
+     *
+     * @param \stdClass $course The course
+     * @param array $action The change
+     * @return string|null The job's id, or null for work that reports elsewhere
+     */
+    private static function launch($course, $action) {
+        self::generator();
+        $context = \context_course::instance($course->id);
+        require_capability('moodle/course:update', $context);
+
+        switch ($action['task']) {
+            case 'read_book_again':
+                $book = self::book_file($context);
+                if (!$book) {
+                    throw new \Exception(get_string('nobookstored', 'local_course_structure'));
+                }
+                $previous = reading::get($course->id);
+                reading::start($course->id, $book, $action['params']['guidance'],
+                    $previous['includesubtopics'] ?? true);
+                return null;
+
+            case 'use_attached_book':
+                $file = self::attachment($course);
+                if (!$file) {
+                    throw new \Exception('The attached file is no longer here. Attach it again.');
+                }
+                $fs = get_file_storage();
+                $fs->delete_area_files($context->id, 'local_course_structure', 'book', 0);
+                $book = $fs->create_file_from_storedfile(array(
+                    'contextid' => $context->id,
+                    'component' => 'local_course_structure',
+                    'filearea' => 'book',
+                    'itemid' => 0,
+                ), $file);
+                $file->delete();
+                reading::start($course->id, $book, '', $action['params']['subtopics']);
+                return null;
+        }
+        return job::start($course, self::TASK_JOBS[$action['task']], $action['params'], $action['summary']);
+    }
+
+    /**
+     * Find a video for a presentation and hold it for the teacher.
+     *
+     * @param \stdClass $course The course
+     * @param int $cmid The presentation
+     * @param string $instructions What the teacher wants
+     * @return string What the model is told
+     */
+    private static function find_video($course, $cmid, $instructions, $embed = false) {
+        self::generator();
+        require_capability('moodle/course:update', \context_course::instance($course->id));
+        $decks = local_course_structure_decks($course->id);
+        if (!isset($decks[$cmid])) {
+            return 'ERROR: there is no presentation with cmid ' . $cmid . '. See generator_info presentations.';
+        }
+        $video = videos::suggest($course, $cmid, $instructions);
+
+        // Asked twice for the same presentation, the teacher answers the latest.
+        self::$videos = array_values(array_filter(self::$videos, function($card) use ($cmid) {
+            return $card['cmid'] !== $cmid;
+        }));
+        self::$videos[] = array('cmid' => $cmid, 'deck' => $decks[$cmid]->name, 'video' => $video, 'embed' => $embed);
+
+        return 'Shown to the teacher, who accepts or declines it on a card under your answer: "' .
+            $video['title'] . '" by ' . $video['channel'] .
+            ($video['language'] !== '' ? ', in ' . $video['language'] : '') . '. ' . $video['reason'] .
+            ' Propose nothing for it; just tell the teacher what you found.';
+    }
+
+    /**
+     * Find a web page for a presentation, or check one the teacher gave, and hold it for them.
+     *
+     * @param \stdClass $course The course
+     * @param int $cmid The presentation
+     * @param string $instructions What the teacher wants
+     * @param string $url A link the teacher gave, or ''
+     * @return string What the model is told
+     */
+    private static function find_link($course, $cmid, $instructions, $url) {
+        self::generator();
+        require_capability('moodle/course:update', \context_course::instance($course->id));
+        $decks = local_course_structure_decks($course->id);
+        if (!isset($decks[$cmid])) {
+            return 'ERROR: there is no presentation with cmid ' . $cmid . '. See generator_info presentations.';
+        }
+        $link = ($url !== '') ? links::suggest_url($course, $cmid, $url) : links::suggest($course, $cmid, $instructions);
+        self::$links = array_values(array_filter(self::$links, function($card) use ($cmid) {
+            return $card['cmid'] !== $cmid;
+        }));
+        self::$links[] = array('cmid' => $cmid, 'deck' => $decks[$cmid]->name, 'link' => $link);
+        return 'Shown to the teacher, who accepts or declines it on a card under your answer: "' . $link['title'] .
+            '" (' . $link['url'] . ')' . ($link['language'] !== '' ? ', in ' . $link['language'] : '') . '. ' .
+            $link['reason'] . ' Propose nothing for it; just tell the teacher what you found.';
+    }
+
+    /**
+     * The book stored for the course.
+     *
+     * @param \context_course $context Course context
+     * @return \stored_file|null
+     */
+    private static function book_file($context) {
+        $files = get_file_storage()->get_area_files($context->id, 'local_course_structure', 'book',
+            0, 'itemid', false);
+        return reset($files) ?: null;
+    }
+
+    /**
+     * Keep a file the teacher attached in the assistant, until they say what it is for.
+     *
+     * One file per teacher and course; a new one replaces the last.
+     *
+     * @param \stdClass $course The course
+     * @param string $path Where the upload is
+     * @param string $filename Its name
+     * @return \stored_file
+     */
+    public static function attach($course, $path, $filename) {
+        global $USER;
+        $context = \context_course::instance($course->id);
+        require_capability('moodle/course:update', $context);
+
+        $fs = get_file_storage();
+        $fs->delete_area_files($context->id, 'local_course_structure', 'attachment', $USER->id);
+        return $fs->create_file_from_pathname(array(
+            'contextid' => $context->id,
+            'component' => 'local_course_structure',
+            'filearea' => 'attachment',
+            'itemid' => $USER->id,
+            'filepath' => '/',
+            'filename' => clean_param($filename, PARAM_FILE) ?: 'book.pdf',
+        ), $path);
+    }
+
+    /**
+     * The file the teacher attached, if any.
+     *
+     * @param \stdClass $course The course
+     * @return \stored_file|null
+     */
+    private static function attachment($course) {
+        global $USER;
+        $files = get_file_storage()->get_area_files(\context_course::instance($course->id)->id,
+            'local_course_structure', 'attachment', $USER->id, 'itemid', false);
+        return reset($files) ?: null;
+    }
+
+    /**
+     * What the model is told about an attached file.
+     *
+     * @param \stdClass $course The course
+     * @return string
+     */
+    private static function attachment_text($course) {
+        $file = self::attachment($course);
+        return $file ? "\n\n=== ATTACHED BY THE TEACHER ===\n" . $file->get_filename() . ' (' .
+            display_size($file->get_filesize()) . '). It can be made the course book with use_attached_book.' : '';
     }
 
     /**
@@ -974,6 +1811,83 @@ class course_agent {
             $cm = get_coursemodule_from_id('quiz', $created->coursemodule, $course->id, false, MUST_EXIST);
             self::add_questions($course, $cm, $action['questions']);
         }
+        return $created;
+    }
+
+    /**
+     * Put a picture attached in the conversation into the course.
+     *
+     * The picture is copied into the files of whatever shows it, as a picture
+     * added through the editor would be, so it stays when the conversation's
+     * copy is gone and is shown to whoever may see that activity or topic.
+     *
+     * @param \stdClass $course The course
+     * @param array $action The change: fileid, where, section, cmid, caption, alt, visible
+     * @throws \Exception if the place named cannot take it
+     */
+    private static function add_image($course, $action) {
+        global $DB;
+        $file = chat_images::file($course, $action['fileid']);
+        $fs = get_file_storage();
+
+        $html = function($name) use ($action) {
+            return '<div class="lcs-image"><p><img src="@@PLUGINFILE@@/' . rawurlencode($name) . '" alt="' .
+                s($action['alt']) . '" style="max-width:100%;height:auto"></p>' .
+                ($action['caption'] !== '' ? '<p><em>' . s($action['caption']) . '</em></p>' : '') . '</div>';
+        };
+        $copy = function($contextid, $component, $filearea, $itemid) use ($fs, $file) {
+            $name = $fs->get_unused_filename($contextid, $component, $filearea, $itemid, '/', $file->get_filename());
+            $fs->create_file_from_storedfile(array('contextid' => $contextid, 'component' => $component,
+                'filearea' => $filearea, 'itemid' => $itemid, 'filepath' => '/', 'filename' => $name), $file);
+            return $name;
+        };
+
+        switch ($action['where']) {
+            case 'new_label':
+                $created = self::create_activity($course, array('type' => 'label', 'section' => $action['section'],
+                    'name' => $action['caption'] !== '' ? $action['caption'] : $action['alt'],
+                    'settings' => array('intro' => $html($file->get_filename()),
+                        'visible' => $action['visible'] ? 1 : 0),
+                    'questions' => array()));
+                $copy(\context_module::instance($created->coursemodule)->id, 'mod_label', 'intro', 0);
+                break;
+
+            case 'page_or_label':
+                $cm = get_fast_modinfo($course)->get_cm($action['cmid']);
+                $places = array('page' => 'content', 'label' => 'intro');
+                if (!isset($places[$cm->modname])) {
+                    throw new \Exception('A picture can be added to a page or a label, not to a ' . $cm->modname .
+                        '. Propose a new label beside it instead.');
+                }
+                $context = \context_module::instance($cm->id);
+                require_capability('moodle/course:manageactivities', $context);
+                $field = $places[$cm->modname];
+                $name = $copy($context->id, 'mod_' . $cm->modname, $field, 0);
+                $record = $DB->get_record($cm->modname, array('id' => $cm->instance), '*', MUST_EXIST);
+                $update = array('id' => $record->id, $field => $record->$field . $html($name),
+                    'timemodified' => time());
+                if ($cm->modname === 'page') {
+                    // Browsers keep a page's files by its revision.
+                    $update['revision'] = $record->revision + 1;
+                }
+                $DB->update_record($cm->modname, (object)$update);
+                break;
+
+            case 'topic_description':
+                $context = \context_course::instance($course->id);
+                require_capability('moodle/course:update', $context);
+                $section = $DB->get_record('course_sections',
+                    array('course' => $course->id, 'section' => $action['section']));
+                if (!$section) {
+                    throw new \Exception('The course has no topic ' . $action['section'] . '.');
+                }
+                $name = $copy($context->id, 'course', 'section', $section->id);
+                $DB->update_record('course_sections', (object)array('id' => $section->id,
+                    'summary' => (string)$section->summary . $html($name), 'summaryformat' => FORMAT_HTML,
+                    'timemodified' => time()));
+                break;
+        }
+        rebuild_course_cache($course->id, true);
     }
 
     /**
@@ -1173,6 +2087,24 @@ class course_agent {
                 break;
             case 'questions':
                 $lines = array_merge(array('cmid ' . $action['cmid']), self::question_lines($action['questions']));
+                break;
+            case 'task':
+            case 'topics':
+                $lines = $action['lines'];
+                break;
+            case 'videodisplay':
+                $lines = array('Video ' . $action['video'] . ' under cmid ' . $action['cmid'] . ' -> ' .
+                    ($action['embed'] ? 'embedded player' : 'link'));
+                break;
+            case 'image':
+                $places = array('new_label' => 'new label in topic ' . $action['section'] .
+                        ($action['visible'] ? '' : ', hidden'),
+                    'page_or_label' => 'end of cmid ' . $action['cmid'],
+                    'topic_description' => 'description of topic ' . $action['section']);
+                $lines = array($action['filename'] . ' -> ' . $places[$action['where']], 'alt: ' . $action['alt']);
+                if ($action['caption'] !== '') {
+                    $lines[] = 'caption: ' . $action['caption'];
+                }
                 break;
             default:
                 $lines = array();

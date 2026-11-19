@@ -102,39 +102,7 @@ if ($revise && confirm_sesskey()) {
     raise_memory_limit(MEMORY_EXTRA);
 
     try {
-        $revised = \mod_book\ai_service::revise_slides($deck->name, $current, $request);
-
-        $newpath = $workdir . '/revised-' . uniqid() . '.pdf';
-        \local_course_structure\slide_deck::render(
-            $deck->name, $deck->chapter, $revised, $newpath);
-
-        // The presentation keeps its place in the course; only its file changes.
-        $fs->delete_area_files($modcontext->id, 'mod_resource', 'content', 0);
-        $fs->create_file_from_pathname(array(
-            'contextid' => $modcontext->id,
-            'component' => 'mod_resource',
-            'filearea'  => 'content',
-            'itemid'    => 0,
-            'filepath'  => '/',
-            'filename'  => clean_param($deck->name, PARAM_FILE) . '.pdf',
-            'sortorder' => 1,
-        ), $newpath);
-        unlink($newpath);
-
-        rebuild_course_cache($courseid, true);
-
-        echo $OUTPUT->notification(
-            get_string('revised', 'local_course_structure', (object)array(
-                'title' => s($deck->name), 'before' => count($current),
-                'after' => count($revised))), 'notifysuccess');
-
-        // Anything made from the old slides is now out of step with them.
-        if ($deck->haspptx ||
-                local_course_structure_exists($courseid, 'csgenlab-' . $deck->index)) {
-            echo $OUTPUT->notification(
-                get_string('revisestale', 'local_course_structure'), 'notifymessage');
-        }
-
+        local_course_structure_revise_deck($course, $deck->cmid, $request, local_course_structure_page_say());
     } catch (Exception $e) {
         echo $OUTPUT->notification(
             get_string('lecturefailed', 'local_course_structure', (object)array(

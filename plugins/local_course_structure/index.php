@@ -33,67 +33,6 @@ $PAGE->set_heading($course->fullname);
 $PAGE->set_pagelayout('incourse');
 
 /**
- * Name the course's topics after a list of chapters.
- *
- * @param int $courseid Course
- * @param array $chapters Chapters, each with a title and possibly a summary
- * @param bool $includesubtopics Whether to list sub-topics under each topic
- * @return void
- */
-function local_course_structure_apply($courseid, $chapters, $includesubtopics) {
-    global $DB;
-
-    $existing = array_values($DB->get_records('course_sections',
-        array('course' => $courseid), 'section ASC'));
-
-    $index = 1; // Section 0 is the general section and is left alone.
-
-    foreach ($chapters as $chapter) {
-        if (trim($chapter['title']) === '') {
-            continue;
-        }
-
-        $summary = ($includesubtopics && !empty($chapter['summary']))
-            ? $chapter['summary'] : '';
-
-        if (isset($existing[$index])) {
-            $section = $existing[$index];
-            $section->name = $chapter['title'];
-            $section->summary = $summary;
-            $section->summaryformat = FORMAT_HTML;
-            $DB->update_record('course_sections', $section);
-        } else {
-            $section = new stdClass();
-            $section->course = $courseid;
-            $section->section = $index;
-            $section->name = $chapter['title'];
-            $section->summary = $summary;
-            $section->summaryformat = FORMAT_HTML;
-            $section->sequence = '';
-            $section->visible = 1;
-            $section->timemodified = time();
-            $DB->insert_record('course_sections', $section);
-        }
-
-        $index++;
-    }
-
-    // Chapter names from an earlier run would otherwise linger on sections the new
-    // structure no longer reaches. Sections holding activities are left alone.
-    for ($i = $index; $i < count($existing); $i++) {
-        $leftover = $existing[$i];
-        if (!empty($leftover->sequence)) {
-            continue;
-        }
-        $leftover->name = null;
-        $leftover->summary = '';
-        $DB->update_record('course_sections', $leftover);
-    }
-
-    rebuild_course_cache($courseid, true);
-}
-
-/**
  * The book stored for the course.
  *
  * @param context_course $context Course context

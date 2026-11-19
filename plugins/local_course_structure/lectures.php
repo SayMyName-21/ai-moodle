@@ -11,7 +11,6 @@ require_once($CFG->dirroot . '/course/modlib.php');
 require_once($CFG->dirroot . '/mod/book/classes/ai_service.php');
 require_once($CFG->dirroot . '/local/course_structure/locallib.php');
 require_once($CFG->dirroot . '/local/course_structure/classes/slide_deck.php');
-require_once($CFG->dirroot . '/local/course_structure/classes/sources.php');
 
 $courseid = required_param('id', PARAM_INT);
 $go = optional_param('go', 0, PARAM_BOOL);
@@ -66,19 +65,10 @@ if ($count > 0) {
     $count = min(max($count, 1), count($sections));
 }
 
-// Match each chapter to the course section carrying its name.
-$sectionof = array();
-foreach ($DB->get_records('course_sections', array('course' => $courseid)) as $section) {
-    if ($section->name !== null && trim($section->name) !== '') {
-        $sectionof[trim($section->name)] = (int)$section->section;
-    }
-}
-
-// The course's topics, any of which a presentation can be filed under.
-$coursetopics = array();
-foreach (get_fast_modinfo($course)->get_section_info_all() as $info) {
-    $coursetopics[(int)$info->section] = get_section_name($course, $info);
-}
+// Match each chapter to the course section carrying its name, and list the
+// course's topics, any of which a presentation can be filed under.
+$sectionof = local_course_structure_sections_by_name($courseid);
+$coursetopics = local_course_structure_course_topics($course);
 
 /**
  * Share the book's sections out over a number of presentations, in book order.
@@ -186,163 +176,24 @@ if ($go && confirm_sesskey()) {
         }
 
         // The teacher's choice of topic, whichever chapters the sections came from.
-        // Anything that is not one of the course's topics falls back to the topic
-        // named after the first section's chapter.
-        $topic = optional_param('topic_' . $i, -1, PARAM_INT);
-
         $groups[] = array(
             'title' => $title,
             'sections' => array_values($picked),
-            'topic' => isset($coursetopics[$topic]) ? $topic : null,
+            'topic' => optional_param('topic_' . $i, -1, PARAM_INT),
         );
     }
 
-    $plan = \mod_book\ai_service::plan_from_selection($outline, $groups);
-
-    if (empty($plan)) {
-        echo $OUTPUT->notification(
-            get_string('nothingselected', 'local_course_structure'), 'notifyerror');
+    try {
+        local_course_structure_build_presentations($course, $groups, $sources, $replace,
+            local_course_structure_page_say());
+    } catch (Exception $e) {
+        echo $OUTPUT->notification($e->getMessage(), 'notifyerror');
         echo $OUTPUT->continue_button(new moodle_url('/local/course_structure/lectures.php',
             array('id' => $courseid)));
         echo $OUTPUT->footer();
         die();
     }
 
-    // Presentations are marked by their position in the run, so a regrouping would
-    // otherwise be skipped as already built. Clearing the earlier run first gives
-    // the new grouping a clean course to land in. Exams are course-wide and may
-    // already have attempts against them, so they are left for the reader to remove.
-    if ($replace) {
-        $old = $DB->get_records_select('course_modules',
-            'course = :course AND (' . $DB->sql_like('idnumber', ':deck') .
-            ' OR ' . $DB->sql_like('idnumber', ':pptx') .
-            ' OR ' . $DB->sql_like('idnumber', ':lab') . ')',
-            array('course' => $courseid, 'deck' => 'csgen-%',
-                  'pptx' => 'csgenppt-%', 'lab' => 'csgenlab-%'),
-            '', 'id');
-
-        foreach ($old as $cm) {
-            ob_start();
-            course_delete_module($cm->id);
-            ob_end_clean();
-        }
-
-        if (!empty($old)) {
-            rebuild_course_cache($courseid, true);
-            echo $OUTPUT->notification(
-                get_string('replacedold', 'local_course_structure', count($old)),
-                'notifymessage');
-            flush();
-        }
-    }
-
-    // The daily token allowance is small enough that a run can stop part way through,
-    // so anything already built is kept and only the gaps are filled. Delete a
-    // presentation in the course to have it built again.
-    $existing = array();
-    $partial = array();
-    $rows = $DB->get_records_sql(
-        "SELECT cm.id, cm.idnumber FROM {course_modules} cm
-           JOIN {modules} m ON m.id = cm.module AND m.name = 'resource'
-          WHERE cm.course = :course AND " . $DB->sql_like('cm.idnumber', ':marker'),
-        array('course' => $courseid, 'marker' => 'csgen-%'));
-
-    foreach ($rows as $row) {
-        $index = (int)substr($row->idnumber, 6);
-        // A deck whose source text was only partly covered is worth building again.
-        if (substr($row->idnumber, -5) === '-part') {
-            $partial[$index] = $row->id;
-        } else {
-            $existing[$index] = true;
-        }
-    }
-
-    if (!empty($existing)) {
-        echo $OUTPUT->notification(
-            get_string('alreadybuilt', 'local_course_structure', count($existing)), 'notifymessage');
-        flush();
-    }
-
-    $made = 0;
-    foreach ($plan as $index => $presentation) {
-        if (isset($existing[$index])) {
-            continue;
-        }
-
-        echo $OUTPUT->notification(
-            get_string('generatingnum', 'local_course_structure', (object)array(
-                'n' => $index + 1, 'total' => count($plan), 'title' => s($presentation['title']))),
-            'notifymessage');
-        flush();
-
-        list($slides, $missed) = local_course_structure_write_slides($bookpath, $outline['offset'],
-            $presentation, function($error) use ($OUTPUT, $presentation) {
-                echo $OUTPUT->notification(
-                    get_string('lecturefailed', 'local_course_structure', (object)array(
-                        'title' => s($presentation['title']), 'error' => s($error))),
-                    'notifyerror');
-                flush();
-            });
-
-        if (empty($slides)) {
-            continue;
-        }
-
-        // English reading on the same topics, looked up only once the presentation
-        // is known to be worth building.
-        $intro = '';
-        if ($sources) {
-            $topics = array($presentation['title']);
-            foreach ($presentation['chunks'] as $chunk) {
-                foreach ($chunk['titles'] as $lesson) {
-                    // The book's own numbering is no help to a search.
-                    $topics[] = preg_replace('/^\s*\d+[\.\)]?\s*/u', '', $lesson);
-                }
-            }
-
-            $links = \local_course_structure\sources::lookup($topics);
-            if (!empty($links)) {
-                $intro = '<p>' . get_string('furtherreading', 'local_course_structure') .
-                         '</p><ul>';
-                foreach ($links as $link) {
-                    $intro .= '<li><a href="' . s($link['url']) .
-                              '" target="_blank" rel="noopener noreferrer">' .
-                              s($link['title']) . '</a></li>';
-                }
-                $intro .= '</ul>';
-            }
-        }
-
-        // Replace an earlier incomplete attempt at this same presentation.
-        if (isset($partial[$index])) {
-            ob_start();
-            course_delete_module($partial[$index]);
-            ob_end_clean();
-        }
-
-        try {
-            $topic = $presentation['topic'] ?? ($sectionof[trim($presentation['chapter'])]
-                ?? ($presentation['chapterindex'] + 1));
-
-            // The deck is labelled with the topic it is filed under, which for a
-            // presentation drawing on several chapters says more than the first.
-            local_course_structure_add_deck($course, $topic, $presentation['title'],
-                $coursetopics[$topic] ?? $presentation['chapter'], $slides,
-                'csgen-' . $index . ($missed > 0 ? '-part' : ''), $intro);
-            $made++;
-
-        } catch (Exception $e) {
-            echo $OUTPUT->notification(
-                get_string('lecturefailed', 'local_course_structure', (object)array(
-                    'title' => s($presentation['title']), 'error' => s($e->getMessage()))),
-                'notifyerror');
-            flush();
-        }
-    }
-
-    rebuild_course_cache($courseid, true);
-    echo $OUTPUT->notification(
-        get_string('lecturesdone', 'local_course_structure', $made), 'notifysuccess');
     echo $OUTPUT->continue_button(new moodle_url('/course/view.php', array('id' => $courseid)));
     echo $OUTPUT->footer();
     die();
