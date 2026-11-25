@@ -1451,13 +1451,23 @@ function local_course_structure_set_intro_block($cmid, $block, $html) {
         $intro .= $part;
     }
 
+    // Shown only when there is something to show. The course page goes by the
+    // course module's showdescription; the file's own page by printintro, which
+    // is kept inside displayoptions (there is no printintro column).
+    $show = (trim(preg_replace('/<!--.*?-->/s', '', $intro)) === '') ? 0 : 1;
+    $options = (string)$DB->get_field('resource', 'displayoptions', array('id' => $cm->instance));
+    $options = ($options === '') ? false : unserialize_array($options);
+    $options = is_array($options) ? $options : array('printintro' => 0, 'showsize' => 1);
+    $options['printintro'] = $show;
+
     $DB->update_record('resource', (object)array(
         'id' => $cm->instance,
         'intro' => $intro,
         'introformat' => FORMAT_HTML,
-        'printintro' => (trim(preg_replace('/<!--.*?-->/s', '', $intro)) === '') ? 0 : 1,
+        'displayoptions' => serialize($options),
         'timemodified' => time(),
     ));
+    $DB->set_field('course_modules', 'showdescription', $show, array('id' => $cmid));
     rebuild_course_cache($cm->course, true);
 }
 
